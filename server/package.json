@@ -1,0 +1,16 @@
+{
+  "name": "hera-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Hera Monitor server - lightweight zero-dependency server monitor dashboard",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}

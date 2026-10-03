@@ -1,0 +1,26 @@
+services:
+  hera-monitor:
+    build: .
+    image: hera-monitor:latest
+    container_name: hera-monitor
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # 面板生成 Agent 一键安装命令时用到的仓库地址
+      HERA_REPO: tmclsamxy/hera-monitor
+      # 走域名反代时填上，一键安装命令会自动使用该地址
+      # HERA_PUBLIC_URL: https://monitor.example.com
+      TZ: Asia/Shanghai
+    volumes:
+      - hera-data:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  hera-data:
+    driver: local

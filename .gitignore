@@ -1,0 +1,20 @@
+# 依赖与构建产物
+node_modules/
+npm-debug.log*
+yarn-error.log*
+package-lock.json
+pnpm-lock.yaml
+
+# 运行时数据（面板配置、密钥、时序指标）
+data/
+*.jsonl
+
+# 临时文件
+.tmp-test/
+*.tmp
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

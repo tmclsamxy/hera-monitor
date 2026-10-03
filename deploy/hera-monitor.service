@@ -1,0 +1,43 @@
+# Hera Monitor 服务端 systemd 单元参考文件
+#
+# 说明：正常情况下不需要手动使用本文件——install.sh 会按实际环境自动生成。
+#      这里提供一份参考，方便你在自定义部署（比如换了安装目录）时手动调整。
+#
+# 手动使用：
+#   sudo cp deploy/hera-monitor.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now hera-monitor
+
+[Unit]
+Description=Hera Monitor - 轻量服务器监控面板
+Documentation=https://github.com/tmclsamxy/hera-monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/hera-monitor
+
+# 请按实际路径调整
+Environment=HERA_PORT=8080
+Environment=HERA_HOST=0.0.0.0
+Environment=HERA_DATA_DIR=/opt/hera-monitor/data
+Environment=HERA_REPO=tmclsamxy/hera-monitor
+Environment=NODE_ENV=production
+
+# 请按 `which node` 的结果调整
+ExecStart=/usr/bin/node /opt/hera-monitor/server/src/index.js
+
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/hera-monitor.log
+StandardError=append:/var/log/hera-monitor.log
+
+# 基础加固
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/hera-monitor/data /var/log
+
+[Install]
+WantedBy=multi-user.target
