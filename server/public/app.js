@@ -69,6 +69,15 @@
 
   const pctText = (v) => `${(Number(v) || 0).toFixed(1)}%`;
 
+  /* 概览页排序方式。
+     custom = 自定义顺序，由用户手动拖拽/上下移动决定，顺序存在服务端的 sortWeight 上。 */
+  const SORT_OPTIONS = [
+    ['name', '按名称'], ['cpu', '按 CPU'], ['mem', '按内存'], ['swap', '按 Swap'],
+    ['disk', '按硬盘'], ['load', '按负载'], ['uptime', '按在线时长'], ['offline', '离线优先'],
+    ['custom', '自定义顺序'],
+  ];
+  const SORT_KEYS = SORT_OPTIONS.map(([v]) => v);
+
   /* ---------------------------------------------------------- 状态 */
 
   const S = {
@@ -82,10 +91,13 @@
     lastDetailFetch: 0,
     search: '',
     group: '',
-    sort: 'name',
+    // 记住排序方式；localStorage 里可能是历史脏值，用白名单挡掉
+    sort: SORT_KEYS.includes(localStorage.getItem('hera_sort')) ? localStorage.getItem('hera_sort') : 'name',
     filter: 'all',
     // 概览页的查看方式：card（卡片）/ list（列表），记住用户选择
     view: localStorage.getItem('hera_view') === 'list' ? 'list' : 'card',
+    // 拖拽排序进行中：期间 SSE 刷新不要重绘，否则会把 DOM 顺序冲掉
+    dragging: false,
   };
 
   /* ---------------------------------------------------------- API */
@@ -548,9 +560,11 @@
     if (S.group) list = list.filter((s) => s.group === S.group);
     if (S.filter === 'online') list = list.filter((s) => s.online);
     if (S.filter === 'offline') list = list.filter((s) => !s.online);
+    // custom 不在这里排序：服务端已按 sortWeight 排好，保持原顺序即可
     if (S.sort === 'name') list.sort((a, b) => a.name.localeCompare(b.name, 'zh'));
     if (S.sort === 'cpu') list.sort((a, b) => (b.sample?.cpu || 0) - (a.sample?.cpu || 0));
     if (S.sort === 'mem') list.sort((a, b) => (b.sample?.mem || 0) - (a.sample?.mem || 0));
+    if (S.sort === 'swap') list.sort((a, b) => (b.sample?.swap || 0) - (a.sample?.swap || 0));
     if (S.sort === 'disk') list.sort((a, b) => (b.sample?.diskPct || 0) - (a.sample?.diskPct || 0));
     if (S.sort === 'load') list.sort((a, b) => (b.sample?.load || 0) - (a.sample?.load || 0));
     if (S.sort === 'uptime') list.sort((a, b) => (b.sample?.uptime || 0) - (a.sample?.uptime || 0));
@@ -558,12 +572,23 @@
     return list;
   }
 
-  const SORT_OPTIONS = [
-    ['name', '按名称'], ['cpu', '按 CPU'], ['mem', '按内存'],
-    ['disk', '按硬盘'], ['load', '按负载'], ['uptime', '按在线时长'], ['offline', '离线优先'],
-  ];
+  const canReorder = () => S.sort === 'custom';
 
-  function metricBar(key, label, pct, extra = '') {
+  /**
+   * 内存指标下方的 Swap 附属行。
+   * 内容全部由内部数字拼出，不掺外部输入，因此调用处直接当 HTML 用。
+   */
+  function swapSub(s) {
+    const total = Number(s.swapTotal) || 0;
+    if (!total) return '<span class="muted">Swap 未启用</span>';
+    const pct = Number(s.sample?.swap) || 0;
+    const used = Number(s.swapUsed) || 0;
+    const title = `${fmtBytes(used)} / ${fmtBytes(total)}`;
+    return `<span class="swap-txt${pct >= 75 ? ' warn' : ''}" title="${esc(title)}">Swap ${esc(pctText(pct))}</span>`;
+  }
+
+  /** 指标条。sub 用于在主指标下方补一行附属信息（例如内存下面的 Swap）。 */
+  function metricBar(key, label, pct, extra = '', sub = '') {
     const v = Number(pct) || 0;
     return `
       <div class="metric"${extra ? ` title="${esc(extra)}"` : ''}>
@@ -572,12 +597,128 @@
           <span class="m-val">${esc(pctText(v))}</span>
         </div>
         <div class="bar"><i class="${usageClass(v)}" style="width:${Math.min(100, v).toFixed(1)}%"></i></div>
+        ${sub ? `<div class="m-sub">${sub}</div>` : ''}
       </div>`;
   }
 
-  function serverCard(s) {
+  /* ---- 自定义排序：拖拽手柄 + 上下移动按钮 ---- */
+
+  /**
+   * 排序手柄。grip 可拖拽；两端不可用方向的按钮直接 disabled，
+   * 免得点了个没反应还以为是 bug。
+   * @param {object} s 服务器
+   * @param {boolean} first 是否当前列表第一条
+   * @param {boolean} last 是否最后一条
+   */
+  function dragHandle(s, first, last) {
+    const id = esc(s.id);
+    return `<div class="drag-handle">
+      <span class="dh-grip" draggable="true" data-drag="${id}" title="按住拖动调整顺序">
+        <svg viewBox="0 0 24 24"><circle cx="9" cy="6" r="1.7"/><circle cx="15" cy="6" r="1.7"/><circle cx="9" cy="12" r="1.7"/><circle cx="15" cy="12" r="1.7"/><circle cx="9" cy="18" r="1.7"/><circle cx="15" cy="18" r="1.7"/></svg>
+      </span>
+      <button class="dh-btn" data-move="up" data-id="${id}" title="上移" ${first ? 'disabled' : ''}>▲</button>
+      <button class="dh-btn" data-move="down" data-id="${id}" title="下移" ${last ? 'disabled' : ''}>▼</button>
+    </div>`;
+  }
+
+  async function saveOrder(ids) {
+    if (!ids.length || !S.overview) return;
+    try {
+      const r = await api('/api/servers/order', { method: 'POST', body: { ids } });
+      if (!r.ok) throw new Error(r.error || '保存失败');
+      // 本地快照同步成新顺序，避免下一次 SSE 刷新时闪回旧顺序
+      const byId = new Map((S.overview?.servers || []).map((x) => [x.id, x]));
+      S.overview.servers = ids.map((id) => byId.get(id)).filter(Boolean)
+        .concat((S.overview.servers || []).filter((x) => !ids.includes(x.id)));
+      toast('顺序已保存');
+    } catch (e) {
+      toast(`保存顺序失败：${e.message}`, 'error');
+      drawServers();
+    }
+  }
+
+  /** 按 id 在当前容器里移动一位 */
+  function moveBy(box, id, delta) {
+    const items = $$('[data-id]', box);
+    const i = items.findIndex((el) => el.dataset.id === id);
+    const j = i + delta;
+    if (i < 0 || j < 0 || j >= items.length) return;
+    const ids = items.map((el) => el.dataset.id);
+    ids.splice(j, 0, ids.splice(i, 1)[0]);
+    saveOrder(ids);
+  }
+
+  /** 绑定自定义排序的拖拽交互（仅 custom 模式生效） */
+  function bindReorder(box) {
+    if (!canReorder()) return;
+    let dragId = null;
+    let dropped = false;
+
+    const itemOf = (id) => $$('[data-id]', box).find((el) => el.dataset.id === id) || null;
+
+    box.addEventListener('dragstart', (e) => {
+      const grip = e.target.closest('[data-drag]');
+      if (!grip) return;
+      dragId = grip.dataset.drag;
+      dropped = false;
+      S.dragging = true;
+      const item = itemOf(dragId);
+      if (item) item.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      // Firefox 里不设置数据就不会真正开始拖拽
+      try { e.dataTransfer.setData('text/plain', dragId); } catch { /* ignore */ }
+    });
+
+    box.addEventListener('dragover', (e) => {
+      if (!dragId) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      const over = e.target.closest('[data-id]');
+      if (!over || over.dataset.id === dragId) return;
+      const drag = itemOf(dragId);
+      if (!drag) return;
+      // 拖过目标元素的中线才插到它后面，否则插到前面 —— 这样预览跟手的直觉一致
+      const r = over.getBoundingClientRect();
+      const after = S.view === 'list'
+        ? e.clientY > r.top + r.height / 2
+        : e.clientX > r.left + r.width / 2;
+      over.parentNode.insertBefore(drag, after ? over.nextSibling : over);
+    });
+
+    box.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropped = true;
+    });
+
+    // dragend 一定会触发（含 ESC 取消），统一在这里收尾
+    box.addEventListener('dragend', () => {
+      const id = dragId;
+      dragId = null;
+      S.dragging = false;
+      $$('.dragging', box).forEach((el) => el.classList.remove('dragging'));
+      if (!id) return;
+      if (!dropped) {
+        // 拖到空白处或按 ESC 取消：DOM 已被挪动过，按服务端顺序还原
+        drawServers();
+        return;
+      }
+      dropped = false;
+      saveOrder($$('[data-id]', box).map((el) => el.dataset.id));
+    });
+
+    box.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-move]');
+      if (!btn) return;
+      e.stopPropagation();
+      moveBy(box, btn.dataset.id, btn.dataset.move === 'up' ? -1 : 1);
+    });
+  }
+
+  function serverCard(s, idx = 0, total = 1) {
     const sm = s.sample;
     const os = s.host?.os || '未知系统';
+    const reorderable = canReorder();
+    const grip = reorderable ? dragHandle(s, idx === 0, idx === total - 1) : '';
     const tags = [
       s.region ? `<span class="tag accent">${esc(s.region)}</span>` : '',
       ...(s.tags || []).map((t) => `<span class="tag">${esc(t)}</span>`),
@@ -586,7 +727,8 @@
 
     if (!sm) {
       return `
-        <div class="server-card offline" data-id="${esc(s.id)}">
+        <div class="server-card offline${reorderable ? ' has-drag' : ''}" data-id="${esc(s.id)}">
+          ${grip}
           <div class="sc-head">
             <span class="status-dot off"></span>
             <span class="sc-name">${esc(s.name)}</span>
@@ -599,7 +741,8 @@
     const loadPct = s.host?.cpuCores ? (sm.load / s.host.cpuCores) * 100 : Math.min(100, sm.load * 25);
 
     return `
-      <div class="server-card ${s.online ? '' : 'offline'}" data-id="${esc(s.id)}">
+      <div class="server-card ${s.online ? '' : 'offline'}${reorderable ? ' has-drag' : ''}" data-id="${esc(s.id)}">
+        ${grip}
         <div class="sc-head">
           <span class="status-dot ${s.online ? 'on' : 'off'}"></span>
           <span class="sc-name" title="${esc(s.name)}">${esc(s.name)}</span>
@@ -611,7 +754,7 @@
         </div>
         <div class="sc-metrics">
           ${metricBar('cpu', 'CPU', sm.cpu, `已用 ${pctText(sm.cpu)}`)}
-          ${metricBar('mem', '内存', sm.mem, s.memTotal ? `${fmtBytes(s.memUsed || (sm.mem / 100) * s.memTotal)} / ${fmtBytes(s.memTotal)}` : '')}
+          ${metricBar('mem', '内存', sm.mem, s.memTotal ? `已用 ${fmtBytes(sm.memUsed || (sm.mem / 100) * s.memTotal)} / ${fmtBytes(s.memTotal)}` : '', swapSub(s))}
           ${metricBar('disk', '硬盘', sm.diskPct, s.diskTotal ? `${fmtBytes((sm.diskPct / 100) * s.diskTotal)} / ${fmtBytes(s.diskTotal)}` : '')}
           ${metricBar('load', '负载', loadPct, `1 分钟负载 ${sm.load.toFixed(2)}${s.host?.cpuCores ? ` / ${s.host.cpuCores} 核` : ''}`)}
         </div>
@@ -634,6 +777,8 @@
   /* ---- 列表视图：一屏能扫更多机器，表头可点击排序 ---- */
 
   const LIST_COLUMNS = [
+    // drag 列只在自定义排序模式下渲染，用来放手柄和上下移动按钮
+    { key: 'drag', label: '' },
     { key: 'name', label: '服务器', sort: 'name', dir: '↑' },
     { key: 'group', label: '分组 / 标签' },
     { key: 'os', label: '系统' },
@@ -646,12 +791,13 @@
     { key: 'actions', label: '' },
   ];
 
-  /** 表格里的「数值 + 迷你进度条」单元格 */
-  function tdMetric(pct, extra = '') {
+  /** 表格里的「数值 + 迷你进度条」单元格；sub 用于补一行附属信息（如 Swap） */
+  function tdMetric(pct, extra = '', sub = '') {
     const v = Number(pct) || 0;
     return `<td class="td-metric"${extra ? ` title="${esc(extra)}"` : ''}>
       <div class="td-val">${esc(pctText(v))}</div>
       <div class="bar mini"><i class="${usageClass(v)}" style="width:${Math.min(100, v).toFixed(1)}%"></i></div>
+      ${sub ? `<div class="td-sub">${sub}</div>` : ''}
     </td>`;
   }
 
@@ -666,10 +812,11 @@
     </div>`;
   }
 
-  function serverRow(s) {
+  function serverRow(s, idx = 0, total = 1) {
     const sm = s.sample;
     const host = s.host || {};
     const online = !!s.online;
+    const dragCell = canReorder() ? `<td class="td-drag">${dragHandle(s, idx === 0, idx === total - 1)}</td>` : '';
 
     const tags = [
       s.group && s.group !== '默认' ? `<span class="tag">${esc(s.group)}</span>` : '',
@@ -688,9 +835,10 @@
     // 从未上报过的机器只占一行提示，不留一堆空列
     if (!sm) {
       return `<tr class="row-offline" data-id="${esc(s.id)}">
+        ${dragCell}
         ${nameCell}
         <td>${tags || '<span class="muted">—</span>'}</td>
-        <td colspan="6" class="muted">尚未收到该服务器的上报数据</td>
+        <td colspan="${canReorder() ? 7 : 6}" class="muted">尚未收到该服务器的上报数据</td>
         <td class="muted">—</td>
         <td>${rowActions(s)}</td>
       </tr>`;
@@ -698,6 +846,7 @@
 
     const loadPct = host.cpuCores ? (sm.load / host.cpuCores) * 100 : Math.min(100, sm.load * 25);
     return `<tr class="${online ? '' : 'row-offline'}" data-id="${esc(s.id)}">
+      ${dragCell}
       ${nameCell}
       <td>${tags || '<span class="muted">默认</span>'}</td>
       <td>
@@ -705,7 +854,7 @@
         <div class="tr-sub">${esc([host.arch, host.cpuCores ? `${host.cpuCores} 核` : ''].filter(Boolean).join(' · ') || '—')}</div>
       </td>
       ${tdMetric(sm.cpu, `已用 ${pctText(sm.cpu)}`)}
-      ${tdMetric(sm.mem, s.memTotal ? `${fmtBytes(sm.memUsed || 0)} / ${fmtBytes(s.memTotal)}` : '')}
+      ${tdMetric(sm.mem, s.memTotal ? `已用 ${fmtBytes(sm.memUsed || 0)} / ${fmtBytes(s.memTotal)}` : '', swapSub(s))}
       ${tdMetric(sm.diskPct, s.diskTotal ? `${fmtBytes((sm.diskPct / 100) * s.diskTotal)} / ${fmtBytes(s.diskTotal)}` : '')}
       ${tdMetric(loadPct, `1 分钟负载 ${sm.load.toFixed(2)}${host.cpuCores ? ` / ${host.cpuCores} 核` : ''}`)}
       <td class="td-net">
@@ -721,6 +870,7 @@
 
   function serverTable(list) {
     const head = LIST_COLUMNS.map((c) => {
+      if (c.key === 'drag') return canReorder() ? '<th class="th-drag"></th>' : '';
       if (!c.sort) return `<th>${esc(c.label)}</th>`;
       const on = S.sort === c.sort;
       // 名称是升序，指标是「大的排前面」，箭头方向要跟着变，否则会误导
@@ -730,7 +880,7 @@
     }).join('');
     return `<div class="server-table-wrap"><table class="server-table">
       <thead><tr>${head}</tr></thead>
-      <tbody>${list.map(serverRow).join('')}</tbody>
+      <tbody>${list.map((s, i) => serverRow(s, i, list.length)).join('')}</tbody>
     </table></div>`;
   }
 
@@ -749,13 +899,18 @@
       box.innerHTML = serverTable(list);
     } else {
       box.className = 'server-grid';
-      box.innerHTML = list.map(serverCard).join('');
+      box.innerHTML = list.map((s, i) => serverCard(s, i, list.length)).join('');
     }
   }
 
   function setView(v) {
     S.view = v === 'list' ? 'list' : 'card';
     localStorage.setItem('hera_view', S.view);
+  }
+
+  function setSort(v) {
+    S.sort = SORT_KEYS.includes(v) ? v : 'name';
+    localStorage.setItem('hera_sort', S.sort);
   }
 
   function overviewSkeleton() {    return `<div class="server-grid">${Array.from({ length: 6 }).map(() => `
@@ -827,7 +982,7 @@
     search.addEventListener('input', () => { S.search = search.value; drawServers(); });
     $('#ovGroup', view).addEventListener('change', (e) => { S.group = e.target.value; drawServers(); });
     $('#ovFilter', view).addEventListener('change', (e) => { S.filter = e.target.value; drawServers(); });
-    $('#ovSort', view).addEventListener('change', (e) => { S.sort = e.target.value; drawServers(); });
+    $('#ovSort', view).addEventListener('change', (e) => { setSort(e.target.value); drawServers(); });
     $('#addServerBtn', view).addEventListener('click', showInstallModal);
 
     // 视图切换
@@ -853,7 +1008,7 @@
       // 列表视图：点表头排序
       const th = e.target.closest('th[data-sort]');
       if (th) {
-        S.sort = th.dataset.sort;
+        setSort(th.dataset.sort);
         const sel = $('#ovSort', view);
         if (sel) sel.value = S.sort;
         drawServers();
@@ -863,6 +1018,7 @@
       if (row && row.dataset.id) location.hash = `#/detail/${row.dataset.id}`;
     });
 
+    bindReorder(document.getElementById('serverBox'));
     bindCopy(view);
   }
 
@@ -1126,6 +1282,8 @@
       ['CPU 型号', host.cpuModel || '—'],
       ['CPU 核心', up],
       ['虚拟化', host.virt || '—'],
+      ['内存使用', s.memTotal ? `${fmtBytes(sm.memUsed || 0)} / ${fmtBytes(s.memTotal)}（${pctText(sm.mem)}）` : '—'],
+      ['Swap 使用', s.swapTotal ? `${fmtBytes(s.swapUsed || 0)} / ${fmtBytes(s.swapTotal)}（${pctText(sm.swap)}）` : '未启用'],
       ['运行时长', fmtDuration(sm.uptime)],
       ['进程数', sm.procs ?? '—'],
       ['TCP 连接', sm.tcp ?? '—'],
@@ -1636,7 +1794,7 @@
       const view = $('#view');
       const box = document.getElementById('serverBox');
       const st = S.overview.stats;
-      if (box && document.activeElement !== $('#ovSearch', view)) {
+      if (box && !S.dragging && document.activeElement !== $('#ovSearch', view)) {
         drawServers();
         const row = $('.stat-row', view);
         if (row) {

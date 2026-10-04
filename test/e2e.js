@@ -30,7 +30,7 @@ async function api(path, { method = 'GET', body, raw } = {}) {
   return { status: res.status, data: await res.json() };
 }
 
-function report(hostname, id, cpu, memUsedPct, rx, tx) {
+function report(hostname, id, cpu, memUsedPct, rx, tx, swapUsedPct = 0) {
   const mem = 4096 * 1024 * 1024;
   return {
     v: 1,
@@ -44,7 +44,7 @@ function report(hostname, id, cpu, memUsedPct, rx, tx) {
     procs: 128, tcp: 42,
     cpu: { usage: cpu, user: cpu * 0.6, system: cpu * 0.3, iowait: 1.2, steal: 0.1 },
     mem: { total: mem, used: mem * (memUsedPct / 100), available: mem * (1 - memUsedPct / 100) },
-    swap: { total: 2 * 1024 ** 3, used: 0 },
+    swap: { total: 2 * 1024 ** 3, used: 2 * 1024 ** 3 * (swapUsedPct / 100) },
     load: { l1: cpu / 25, l5: cpu / 30, l15: cpu / 40 },
     disks: [
       { fs: '/dev/vda1', mount: '/', total: 40 * 1024, used: 24 * 1024, pct: 61 },
@@ -68,9 +68,15 @@ function report(hostname, id, cpu, memUsedPct, rx, tx) {
   // 概览页双视图：确保前端资源里确实带上了这块实现
   ok('/app.js 含视图切换实现', r.text.includes('view-switch') && r.text.includes('serverTable') && r.text.includes('setView'));
   ok('/app.js 记住视图选择', r.text.includes("localStorage.setItem('hera_view'"));
+  ok('/app.js 含 Swap 显示实现', r.text.includes('swapSub') && r.text.includes('swapTotal'));
+  ok('/app.js 含自定义排序实现',
+    r.text.includes('dragHandle') && r.text.includes('bindReorder') && r.text.includes('/api/servers/order'));
+  ok('/app.js 记住排序方式', r.text.includes("localStorage.setItem('hera_sort'"));
   r = await api('/style.css', { raw: true });
   ok('GET /style.css', r.status === 200 && r.text.includes('--accent'));
   ok('/style.css 含列表视图样式', r.text.includes('.server-table') && r.text.includes('.view-switch'));
+  ok('/style.css 含排序手柄与指标附属行样式',
+    r.text.includes('.drag-handle') && r.text.includes('.dh-grip') && r.text.includes('.td-sub'));
   r = await api('/install-agent.sh', { raw: true });
   ok('GET /install-agent.sh', r.status === 200 && r.text.startsWith('#!/usr/bin/env bash'));
   r = await api('/agent/hera-agent.sh', { raw: true });
@@ -103,7 +109,7 @@ function report(hostname, id, cpu, memUsedPct, rx, tx) {
       const res = await fetch(BASE + '/api/agent/report', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Agent-Key': key },
-        body: JSON.stringify(report(names[i], ids[i], 10 + round * 6 + i * 12, 40 + round * 4, rx0, rx0 / 3)),
+        body: JSON.stringify(report(names[i], ids[i], 10 + round * 6 + i * 12, 40 + round * 4, rx0, rx0 / 3, i === 0 ? 40 : 0)),
       });
       if (round === 0 && i === 0) {
         const d = await res.json();
@@ -125,6 +131,9 @@ function report(hostname, id, cpu, memUsedPct, rx, tx) {
   ok('磁盘信息完整', s0?.disks?.length === 2);
   ok('主机信息完整', s0?.host?.os === 'Ubuntu 22.04.4 LTS' && s0?.host?.cpuCores === 4);
   ok('地区标签识别', s0?.region === 'HK', s0?.region);
+  ok('Swap 总容量已下发', s0?.swapTotal === 2 * 1024 ** 3, `${s0?.swapTotal} 字节`);
+  ok('Swap 使用率已计算', s0?.sample?.swap === 40, `${s0?.sample?.swap}%`);
+  ok('Swap 已用量已下发', Math.round(s0?.swapUsed || 0) === Math.round(2 * 1024 ** 3 * 0.4), `${s0?.swapUsed} 字节`);
 
   r = await api(`/api/metrics?id=${s0.id}&range=1h&points=100`);
   ok('指标时序查询', r.data.data.points.length >= 1 && r.data.data.count >= 6, `${r.data.data.count} 条原始采样 → ${r.data.data.points.length} 个降采样点`);
@@ -299,6 +308,25 @@ function report(hostname, id, cpu, memUsedPct, rx, tx) {
 
   r = await api('/api/bootstrap');
   ok('默认分组与排序正常', r.data.overview.servers.length > 0);
+
+  console.log('\n=== 11. 自定义排序 ===');
+  const beforeOrder = r.data.overview.servers.map((s) => s.id);
+  const reversed = [...beforeOrder].reverse();
+
+  let ro = await api('/api/servers/order', { method: 'POST', body: { ids: reversed } });
+  ok('排序接口接受完整 id 列表', ro.status === 200 && ro.data.updated === reversed.length, `updated=${ro.data.updated}`);
+
+  const afterOrder = (await api('/api/bootstrap')).data.overview.servers.map((s) => s.id);
+  ok('展示顺序与提交顺序一致', afterOrder.join() === reversed.join(), afterOrder.join(' → ').slice(0, 40));
+  ok('排序不增删服务器', afterOrder.length === beforeOrder.length, `${beforeOrder.length} → ${afterOrder.length}`);
+  ok('顺序已落盘（sortWeight 生效）', reversed.length < 2 || afterOrder.join() !== beforeOrder.join());
+
+  ro = await api('/api/servers/order', { method: 'POST', body: {} });
+  ok('缺少 ids 被拒绝', ro.status === 400, ro.data.error);
+  ro = await api('/api/servers/order', { method: 'POST', body: { ids: 'not-an-array' } });
+  ok('ids 非数组被拒绝', ro.status === 400);
+  ro = await api('/api/servers/order', { method: 'POST', body: { ids: ['不存在的机器', reversed[0]] } });
+  ok('未知 id 被静默跳过', ro.status === 200 && ro.data.updated === 1, `updated=${ro.data.updated}`);
 
   console.log(`\n${'═'.repeat(50)}`);
   console.log(`  测试完成：通过 ${pass} 项，失败 ${fail} 项`);

@@ -137,6 +137,39 @@ export function updateServer(id, patch) {
   return s;
 }
 
+/**
+ * 按给定顺序重排服务器（手动排序）。
+ *
+ * 权重从「现有最大值 + 步长」开始依次递减，这样：
+ * - 传入的这批机器顺序就是最终展示顺序；
+ * - 未参与排序的机器（隐藏的、别的分组的）权重不变，
+ *   因而始终排在手动排过序的机器之后，不会被顶到前面去。
+ *
+ * @param {string[]} ids 服务器 id，按期望的展示顺序排列
+ * @returns {number} 实际更新的台数
+ */
+export function reorderServers(ids) {
+  const list = Array.isArray(ids) ? ids.filter((x) => typeof x === 'string' && x) : [];
+  if (!list.length) return 0;
+
+  let max = 0;
+  for (const s of state.servers.values()) {
+    if (s.sortWeight > max) max = s.sortWeight;
+  }
+
+  const step = 100;
+  let updated = 0;
+  list.forEach((id, i) => {
+    const s = state.servers.get(id);
+    if (!s) return;
+    s.sortWeight = max + step * (list.length - i);
+    updated += 1;
+  });
+
+  if (updated) saveServers(true);
+  return updated;
+}
+
 export function deleteServer(id) {
   const s = state.servers.get(id);
   if (!s) return false;
@@ -500,6 +533,8 @@ export function overview({ includeHidden = false } = {}) {
       totalTx: s.totalTx,
       uptime: s.latest?.uptime || 0,
       memTotal: s.latest?.memTotal || 0,
+      swapTotal: s.latest?.swapTotal || 0,
+      swapUsed: s.latest?.swapUsed || 0,
       diskTotal: s.latest?.diskTotal || 0,
       note: s.note,
       price: s.price,

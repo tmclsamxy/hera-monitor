@@ -397,6 +397,56 @@ table.server-table tr.row-offline { opacity: .72; }
 .row-actions { display: flex; gap: 2px; justify-content: flex-end; }
 .row-actions .icon-btn { width: 28px; height: 28px; }
 
+/* ------------------------------------------ 指标附属行（内存下面的 Swap） */
+
+.metric .m-sub,
+.td-metric .td-sub {
+  margin-top: 4px; font-size: 10.5px; color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.td-metric .td-sub { margin-top: 3px; }
+.metric .m-sub .swap-txt.warn,
+.td-metric .td-sub .swap-txt.warn { color: var(--amber); }
+
+/* ---------------------------------------------------------- 自定义排序 */
+
+.server-card.has-drag { padding-left: 40px; }
+
+.drag-handle {
+  position: absolute; left: 9px; top: 50%; transform: translateY(-50%);
+  display: flex; flex-direction: column; align-items: center; gap: 1px;
+  z-index: 3;
+}
+
+.dh-grip {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 16px; border-radius: 4px;
+  color: var(--muted); cursor: grab;
+}
+.dh-grip:hover { color: var(--text); background: var(--panel-2); }
+.dh-grip:active { cursor: grabbing; }
+.dh-grip svg { width: 13px; height: 13px; fill: currentColor; }
+
+.dh-btn {
+  width: 20px; height: 15px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 8px; line-height: 1; color: var(--muted);
+  background: transparent; border: 0; border-radius: 4px; cursor: pointer;
+}
+.dh-btn:hover:not(:disabled) { color: var(--text); background: var(--panel-2); }
+.dh-btn:disabled { opacity: .28; cursor: default; }
+
+/* 拖拽中的元素 */
+.server-card.dragging { opacity: .45; border-style: dashed; border-color: var(--accent); }
+tr.dragging > td { opacity: .45; }
+
+/* 列表视图：手柄横排放在行首，不占额外的行高 */
+.th-drag, .td-drag { width: 1%; padding-right: 0 !important; }
+.td-drag .drag-handle { position: static; transform: none; flex-direction: row; gap: 0; }
+.td-drag .dh-grip { width: 16px; height: 22px; }
+.td-drag .dh-btn { width: 16px; height: 22px; font-size: 9px; }
+
 /* ---------------------------------------------------------- 详情页 */
 
 .detail-head { display: flex; align-items: flex-start; gap: 14px; margin-bottom: 18px; flex-wrap: wrap; }

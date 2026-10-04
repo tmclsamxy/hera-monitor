@@ -10,7 +10,7 @@ import {
 import {
   state, loadAll, overview, queryMetrics, listServers, getServer, updateServer, deleteServer,
   ingestReport, listMonitors, saveMonitors, deleteMonitor, queryProbes, logEvent, listEvents,
-  markOffline, pruneOldData, saveServers,
+  markOffline, pruneOldData, saveServers, reorderServers,
 } from './store.js';
 import {
   CHANNEL_TYPES, RULE_TYPES, addChannel, updateChannel, removeChannel,
@@ -391,6 +391,19 @@ route('GET', '/api/metrics', async (ctx) => {
 
 route('GET', '/api/events', async (ctx) => {
   sendJSON(ctx.res, 200, { ok: true, events: listEvents(Number(ctx.query.get('limit')) || 100) });
+});
+
+// 注意：必须注册在 /api/servers/:id 之前，否则会被 :id 抢先匹配走
+route('POST', '/api/servers/order', async (ctx) => {
+  const ids = ctx.body?.ids;
+  if (!Array.isArray(ids)) {
+    sendJSON(ctx.res, 400, { ok: false, error: '缺少 ids 数组' });
+    return;
+  }
+  const updated = reorderServers(ids);
+  logEvent('server-order', `调整了 ${updated} 台服务器的显示顺序`);
+  sendJSON(ctx.res, 200, { ok: true, updated });
+  scheduleBroadcast();
 });
 
 route('POST', '/api/servers/:id', async (ctx) => {

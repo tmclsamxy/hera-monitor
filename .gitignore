@@ -9,8 +9,8 @@ pnpm-lock.yaml
 data/
 *.jsonl
 
-# 临时文件
-.tmp-test/
+# 临时文件（截图、调试、测试工作目录）
+.tmp*/
 .verify/
 *.tmp
 *.log

@@ -16,7 +16,8 @@ FAIL=0
 ok()  { PASS=$((PASS + 1)); printf '  \033[32m✅\033[0m %s%s\n' "$1" "${2:+ — $2}"; }
 bad() { FAIL=$((FAIL + 1)); printf '  \033[31m❌\033[0m %s%s\n' "$1" "${2:+ — $2}"; }
 
-WORK=".tmp-test"
+# 注意：这个工作目录名不要用 .tmp-test —— 截图/调试也常放那儿，跑测试会把它清掉
+WORK=".tmp-args"
 FAKE="$ROOT/$WORK/fake"
 FRESH="$ROOT/$WORK/fresh"
 
