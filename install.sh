@@ -3,14 +3,19 @@
 # Hera Monitor 服务端一键部署脚本
 #
 # 用法：
-#   # 从仓库直接部署（推荐）
+#   # 从仓库直接部署（自动选择 Docker，没有 Docker 则走裸机 + systemd）
 #   curl -fsSL https://raw.githubusercontent.com/tmclsamxy/hera-monitor/main/install.sh | sudo bash
 #
-#   # 已克隆仓库，本地部署
-#   sudo bash install.sh
+#   # 自定义端口（两种模式都生效）
+#   curl -fsSL .../install.sh | sudo bash -s -- --port 9000
+#   sudo bash install.sh --port 9000
 #
-#   # 自定义端口与安装目录
-#   sudo bash install.sh --port 9000 --dir /opt/hera
+#   # 强制指定部署方式
+#   sudo bash install.sh --port 9000 --mode docker
+#   sudo bash install.sh --port 9000 --mode native
+#
+#   # 直接用预构建镜像（不本地构建）
+#   sudo bash install.sh --port 9000 --mode docker --image ghcr.io/tmclsamxy/hera-monitor:latest
 #
 set -u
 
@@ -19,11 +24,18 @@ BRANCH="${HERA_BRANCH:-main}"
 INSTALL_DIR="/opt/hera-monitor"
 PORT="8080"
 HOST="0.0.0.0"
+MODE="auto"
+IMAGE=""
+PUBLIC_URL=""
 SERVICE_NAME="hera-monitor"
 NODE_MIN_MAJOR=18
 NO_SERVICE=0
 UNINSTALL=0
 FORCE=0
+DRY_RUN=0
+COMPOSE=""
+COMPOSE_SERVICE="hera-monitor"
+DEPLOY_KIND=""   # compose | run
 
 ORIG_ARGS=("$@")
 
@@ -43,74 +55,290 @@ Hera Monitor 服务端一键部署
 用法:
   install.sh [选项]
 
-选项:
-  --port PORT       面板监听端口，默认 8080
+部署方式:
+  --mode MODE       auto（默认）/ docker / native
+                    auto = 检测到可用 Docker 就用 Docker，否则走裸机 + systemd
+  --image IMAGE     仅 Docker 模式：直接用预构建镜像，不本地构建
+                    例如 ghcr.io/tmclsamxy/hera-monitor:latest
+
+网络与端口:
+  --port PORT       面板对外端口，默认 8080（两种模式均生效）
   --host HOST       监听地址，默认 0.0.0.0
+                    native 模式 = 服务监听地址；docker 模式 = 宿主机绑定地址
+                    填 127.0.0.1 则只允许本机访问（适合 Nginx 反代）
+  --public-url URL  面板公网地址，填了之后生成的一键接入命令会用它
+                    例如 https://monitor.example.com
+
+其它:
   --dir DIR         安装目录，默认 /opt/hera-monitor
   --repo OWNER/REPO GitHub 仓库，默认 tmclsamxy/hera-monitor
   --branch BRANCH   分支名，默认 main
-  --no-service      只部署不注册系统服务
-  --force           覆盖已存在的安装目录
-  --uninstall       卸载（保留数据目录）
+  --no-service      native 模式：只部署不注册系统服务
+  --force           覆盖已存在的程序文件（保留 data 数据目录）
+  --dry-run         演练：只打印将要执行的操作，不做任何改动
+  --uninstall       卸载（数据目录默认保留）
   -h, --help        显示帮助
+
+示例:
+  sudo bash install.sh --port 9000
+  sudo bash install.sh --dry-run --port 9000
+  sudo bash install.sh --mode docker --port 9000 --host 127.0.0.1
+  curl -fsSL <仓库>/install.sh | sudo bash -s -- --port 9000
 EOF
 }
 
+# ---------------------------------------------------------------- 参数解析
 while [ $# -gt 0 ]; do
   case "$1" in
     --port)       PORT="${2:-}"; shift 2 ;;
     --host)       HOST="${2:-}"; shift 2 ;;
+    --mode)       MODE="${2:-}"; shift 2 ;;
+    --image)      IMAGE="${2:-}"; shift 2 ;;
+    --public-url) PUBLIC_URL="${2:-}"; shift 2 ;;
     --dir)        INSTALL_DIR="${2:-}"; shift 2 ;;
     --repo)       REPO="${2:-}"; shift 2 ;;
     --branch)     BRANCH="${2:-}"; shift 2 ;;
     --no-service) NO_SERVICE=1; shift ;;
     --force)      FORCE=1; shift ;;
+    --dry-run)    DRY_RUN=1; shift ;;
     --uninstall)  UNINSTALL=1; shift ;;
     -h|--help)    usage; exit 0 ;;
     *) die "未知参数: $1（用 --help 查看用法）" ;;
   esac
 done
 
-case "$PORT" in ''|*[!0-9]*) die "端口必须是数字" ;; esac
+# ---- 参数校验
+case "$PORT" in
+  ''|*[!0-9]*) die "--port 必须是数字，收到：${PORT}" ;;
+esac
+[ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "--port 必须在 1-65535 之间，收到：${PORT}"
+
+case "$MODE" in
+  auto|docker|native) ;;
+  *) die "--mode 只能是 auto / docker / native，收到：${MODE}" ;;
+esac
+
+case "$INSTALL_DIR" in
+  /*) ;;
+  *) die "--dir 必须是绝对路径，收到：${INSTALL_DIR}" ;;
+esac
+
+[ -n "$PUBLIC_URL" ] && PUBLIC_URL="${PUBLIC_URL%/}"
 
 # ------------------------------------------------------------------ 权限
-if [ "$(id -u)" != "0" ]; then
+# Docker 模式下若当前用户已在 docker 组，其实不需要 root；
+# 但安装目录默认在 /opt，仍然需要写权限，所以统一按需提权。
+need_root=1
+if [ "$MODE" = "docker" ] && [ "$(id -u)" != "0" ] \
+   && command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 \
+   && [ -w "$(dirname "$INSTALL_DIR")" ] 2>/dev/null; then
+  need_root=0
+fi
+
+if [ "$need_root" = "1" ] && [ "$(id -u)" != "0" ] && [ "$DRY_RUN" != "1" ]; then
   SELF="$0"
   if [ ! -f "$SELF" ]; then
-    die "需要 root 权限。请改用：curl -fsSL https://raw.githubusercontent.com/${REPO}/${BRANCH}/install.sh | sudo bash"
+    die "需要 root 权限。请改用：curl -fsSL https://raw.githubusercontent.com/${REPO}/${BRANCH}/install.sh | sudo bash -s -- ${ORIG_ARGS[*]:-}"
   fi
   command -v sudo >/dev/null 2>&1 || die "当前不是 root 且未安装 sudo，请以 root 身份运行"
   info "需要 root 权限，正在通过 sudo 重新执行…"
   exec sudo -E bash "$SELF" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
 fi
 
+# ----------------------------------------------------------- 环境探测工具
+detect_compose() {
+  if docker compose version >/dev/null 2>&1; then
+    COMPOSE="docker compose"
+    return 0
+  fi
+  if command -v docker-compose >/dev/null 2>&1; then
+    COMPOSE="docker-compose"
+    return 0
+  fi
+  return 1
+}
+
+docker_usable() {
+  command -v docker >/dev/null 2>&1 || return 1
+  docker info >/dev/null 2>&1 || return 1
+  detect_compose || return 1
+  return 0
+}
+
+# 优先用宿主机 curl 探活；没有 curl 就在容器内自测
+docker_health_ok() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS --max-time 2 --noproxy '*' "http://127.0.0.1:${PORT}/api/health" >/dev/null 2>&1 && return 0
+    return 1
+  fi
+  docker exec "$COMPOSE_SERVICE" node -e \
+    "fetch('http://127.0.0.1:'+(process.env.HERA_PORT||8080)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" \
+    >/dev/null 2>&1
+}
+
 # ------------------------------------------------------------------ 卸载
 if [ "$UNINSTALL" = "1" ]; then
   info "开始卸载 Hera Monitor…"
+
+  # Docker 模式：先停容器（compose 与 docker run 两种方式都覆盖）
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    if [ -f "${INSTALL_DIR}/docker-compose.yml" ] && detect_compose; then
+      ( cd "$INSTALL_DIR" && $COMPOSE down >/dev/null 2>&1 ) && ok "已通过 Compose 停止并移除容器"
+    fi
+    if docker inspect "$COMPOSE_SERVICE" >/dev/null 2>&1; then
+      docker rm -f "$COMPOSE_SERVICE" >/dev/null 2>&1 && ok "已移除容器 ${COMPOSE_SERVICE}"
+    fi
+  fi
+
+  # 裸机模式：停 service
   if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
     systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
     rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
     systemctl daemon-reload >/dev/null 2>&1 || true
   fi
-  rm -rf "$INSTALL_DIR/server" "$INSTALL_DIR/agent" "$INSTALL_DIR/install.sh" \
-         "$INSTALL_DIR/README.md" "$INSTALL_DIR/LICENSE" "$INSTALL_DIR/deploy" \
-         "$INSTALL_DIR/Dockerfile" "$INSTALL_DIR/docker-compose.yml"
-  ok "已卸载程序文件。数据保留在 ${INSTALL_DIR}/data，如需彻底删除请手动执行 rm -rf"
+  pkill -f "${INSTALL_DIR}/server/src/index.js" >/dev/null 2>&1 || true
+
+  rm -rf "$INSTALL_DIR/server" "$INSTALL_DIR/agent" "$INSTALL_DIR/deploy" \
+         "$INSTALL_DIR/install.sh" "$INSTALL_DIR/README.md" "$INSTALL_DIR/LICENSE" \
+         "$INSTALL_DIR/Dockerfile" "$INSTALL_DIR/docker-compose.yml" "$INSTALL_DIR/.env"
+  ok "程序文件已删除。数据默认保留"
+  printf '  彻底清理数据：\n'
+  printf '    裸机模式   rm -rf %s/data\n' "$INSTALL_DIR"
+  printf '    Compose    docker volume rm %s_hera-data\n' "$(basename "$INSTALL_DIR")"
+  printf '    docker run docker volume rm hera-data\n'
   exit 0
 fi
 
-# ------------------------------------------------------------- 依赖检查
-command -v curl >/dev/null 2>&1 || {
-  info "未找到 curl，尝试自动安装…"
-  if command -v apt-get >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq curl
-  elif command -v dnf >/dev/null 2>&1; then dnf install -y -q curl
-  elif command -v yum >/dev/null 2>&1; then yum install -y -q curl
-  elif command -v apk >/dev/null 2>&1; then apk add --no-cache curl
-  else die "请先手动安装 curl"; fi
-}
-command -v tar >/dev/null 2>&1 || die "未找到 tar，请先安装"
+# ------------------------------------------------------------ 获取程序文件
+fetch_files() {
+  step "准备程序文件到 ${INSTALL_DIR}"
 
+  if [ -d "$INSTALL_DIR/server" ] && [ "$FORCE" != "1" ]; then
+    warn "${INSTALL_DIR}/server 已存在，将就地升级（保留 data 目录）"
+  fi
+  mkdir -p "$INSTALL_DIR"
+
+  local src_dir
+  src_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo '')"
+
+  if [ -n "$src_dir" ] && [ -f "${src_dir}/server/src/index.js" ]; then
+    info "来源：本地目录 ${src_dir}"
+    rm -rf "${INSTALL_DIR}/server" "${INSTALL_DIR}/agent" "${INSTALL_DIR}/deploy"
+    cp -a "${src_dir}/server" "$INSTALL_DIR/"
+    [ -d "${src_dir}/agent" ] && cp -a "${src_dir}/agent" "$INSTALL_DIR/"
+    [ -d "${src_dir}/deploy" ] && cp -a "${src_dir}/deploy" "$INSTALL_DIR/"
+    for f in install.sh README.md LICENSE Dockerfile docker-compose.yml .env.example; do
+      [ -f "${src_dir}/${f}" ] && cp -a "${src_dir}/${f}" "$INSTALL_DIR/"
+    done
+  else
+    command -v curl >/dev/null 2>&1 || die "未找到 curl，请先安装"
+    info "来源：GitHub ${REPO}@${BRANCH}"
+    local tmp
+    tmp="$(mktemp -d)"
+    local url="https://codeload.github.com/${REPO}/tar.gz/refs/heads/${BRANCH}"
+    curl -fsSL --retry 3 -o "${tmp}/hera.tar.gz" "$url" || die "下载仓库失败：${url}"
+    tar -xzf "${tmp}/hera.tar.gz" -C "$tmp" || die "解压失败"
+    local pkg
+    pkg="$(find "$tmp" -maxdepth 1 -type d -name 'hera-monitor-*' | head -n1)"
+    [ -n "$pkg" ] || die "包结构异常"
+    rm -rf "${INSTALL_DIR}/server" "${INSTALL_DIR}/agent" "${INSTALL_DIR}/deploy"
+    cp -a "${pkg}/server" "$INSTALL_DIR/"
+    [ -d "${pkg}/agent" ] && cp -a "${pkg}/agent" "$INSTALL_DIR/"
+    [ -d "${pkg}/deploy" ] && cp -a "${pkg}/deploy" "$INSTALL_DIR/"
+    for f in install.sh README.md LICENSE Dockerfile docker-compose.yml .env.example; do
+      [ -f "${pkg}/${f}" ] && cp -a "${pkg}/${f}" "$INSTALL_DIR/"
+    done
+    rm -rf "$tmp"
+  fi
+
+  chmod +x "${INSTALL_DIR}/install.sh" 2>/dev/null || true
+  chmod +x "${INSTALL_DIR}/agent/"*.sh 2>/dev/null || true
+  chmod +x "${INSTALL_DIR}/deploy/"*.sh 2>/dev/null || true
+  mkdir -p "${INSTALL_DIR}/data"
+  ok "程序文件就绪"
+}
+
+# ============================================================ Docker 模式
+deploy_docker() {
+  step "检查 Docker 环境"
+  command -v docker >/dev/null 2>&1 || die "未检测到 docker。请先安装 Docker，或改用 --mode native"
+
+  if ! docker info >/dev/null 2>&1; then
+    die "无法连接 Docker 守护进程。请在 root 下运行，或把当前用户加入 docker 组：sudo usermod -aG docker \$USER"
+  fi
+  ok "Docker 可用（$(docker --version 2>/dev/null | head -1)）"
+
+  detect_compose || die "未检测到 docker compose 插件或 docker-compose 命令。请安装 Compose，或改用 --mode native"
+  ok "Compose 可用（${COMPOSE}）"
+
+  fetch_files
+
+  step "写入部署配置"
+  umask 077
+  cat > "${INSTALL_DIR}/.env" <<EOF
+# 由 install.sh 生成，可随时手工修改后执行 ${COMPOSE} up -d 生效
+HERA_PORT=${PORT}
+HERA_BIND=${HOST}
+EOF
+  if [ -n "$PUBLIC_URL" ]; then
+    printf 'HERA_PUBLIC_URL=%s\n' "$PUBLIC_URL" >> "${INSTALL_DIR}/.env"
+  fi
+  chmod 600 "${INSTALL_DIR}/.env"
+  ok "端口 ${PORT}，绑定 ${HOST}${PUBLIC_URL:+，公网地址 ${PUBLIC_URL}}"
+
+  step "构建并启动容器"
+  if [ -n "$IMAGE" ]; then
+    # 用预构建镜像：直接 docker run，避免去改写 compose 文件
+    DEPLOY_KIND="run"
+    info "使用预构建镜像：${IMAGE}"
+    docker rm -f "$COMPOSE_SERVICE" >/dev/null 2>&1 || true
+    # shellcheck disable=SC2086
+    docker run -d --name "$COMPOSE_SERVICE" --init --restart unless-stopped \
+      -p "${HOST}:${PORT}:8080" \
+      -v hera-data:/data \
+      -e HERA_HOST=0.0.0.0 \
+      -e HERA_PORT=8080 \
+      -e HERA_DATA_DIR=/data \
+      -e HERA_REPO="$REPO" \
+      -e TZ=Asia/Shanghai \
+      ${PUBLIC_URL:+-e HERA_PUBLIC_URL="$PUBLIC_URL"} \
+      "$IMAGE" >/dev/null || die "容器启动失败，检查镜像是否存在：${IMAGE}"
+  else
+    DEPLOY_KIND="compose"
+    ( cd "$INSTALL_DIR" && $COMPOSE up -d --build ) \
+      || die "容器启动失败，查看日志：cd ${INSTALL_DIR} && ${COMPOSE} logs"
+  fi
+  ok "容器已启动"
+
+  step "等待服务就绪"
+  local ready=0 i
+  for i in $(seq 1 40); do
+    if docker_health_ok; then
+      ready=1
+      break
+    fi
+    sleep 1
+  done
+  if [ "$ready" = "1" ]; then
+    ok "服务已就绪，健康检查通过"
+  else
+    warn "40 秒内健康检查未通过，最近日志："
+    docker logs --tail 30 "$COMPOSE_SERVICE" 2>&1 | sed 's/^/    /' || true
+    warn "排障：bash ${INSTALL_DIR}/deploy/troubleshoot.sh --port ${PORT}"
+  fi
+
+  INITIAL_PWD=""
+  if [ "$ready" = "1" ]; then
+    INITIAL_PWD="$( docker exec "$COMPOSE_SERVICE" cat /data/initial-password.txt 2>/dev/null | tr -d '\r\n' )" || true
+  fi
+
+  # 端口是否在安全组放行是容器部署最常见的坑，明确提示
+  PUBLIC_IP="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || echo '')"
+  print_summary "docker" "$PUBLIC_IP" "$INITIAL_PWD"
+}
+
+# ============================================================ 裸机模式
 node_ok() {
   command -v node >/dev/null 2>&1 || return 1
   local v major
@@ -123,7 +351,7 @@ node_ok() {
 install_node() {
   step "本机缺少 Node.js ${NODE_MIN_MAJOR}+，开始自动安装"
 
-  local arch os tarball base
+  local arch
   arch="$(uname -m)"
   case "$arch" in
     x86_64|amd64) arch="x64" ;;
@@ -132,7 +360,6 @@ install_node() {
     *) die "不支持的 CPU 架构：$arch，请手动安装 Node.js ${NODE_MIN_MAJOR}+" ;;
   esac
 
-  # 优先走系统包管理器（更快，且与系统集成）
   if command -v apt-get >/dev/null 2>&1; then
     info "使用 NodeSource 源安装 Node.js 22"
     if curl -fsSL "https://deb.nodesource.com/setup_22.x" | bash - >/dev/null 2>&1 \
@@ -142,7 +369,8 @@ install_node() {
     fi
     warn "NodeSource 安装失败，改用官方二进制包"
   elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
-    local pm; command -v dnf >/dev/null 2>&1 && pm=dnf || pm=yum
+    local pm
+    command -v dnf >/dev/null 2>&1 && pm=dnf || pm=yum
     info "使用 NodeSource 源安装 Node.js 22"
     if curl -fsSL "https://rpm.nodesource.com/setup_22.x" | bash - >/dev/null 2>&1 \
        && $pm install -y -q nodejs >/dev/null 2>&1 && node_ok; then
@@ -152,16 +380,19 @@ install_node() {
     warn "NodeSource 安装失败，改用官方二进制包"
   fi
 
-  # 兜底：官方静态二进制包
-  base="https://nodejs.org/dist/latest-v22.x"
+  local base="https://nodejs.org/dist/latest-v22.x"
+  local tarball
   tarball="$(curl -fsSL "${base}/" 2>/dev/null | grep -o "node-v[0-9.]*-linux-${arch}\.tar\.gz" | head -n1)"
   [ -n "$tarball" ] || die "无法获取 Node.js 二进制包，请检查网络后手动安装"
   info "下载 ${tarball}"
-  local tmp; tmp="$(mktemp -d)"
+  local tmp
+  tmp="$(mktemp -d)"
   curl -fsSL --retry 3 -o "${tmp}/node.tar.gz" "${base}/${tarball}" || die "下载 Node.js 失败"
   tar -xzf "${tmp}/node.tar.gz" -C "$tmp" || die "解压 Node.js 失败"
-  local src; src="$(find "$tmp" -maxdepth 1 -type d -name 'node-v*' | head -n1)"
+  local src
+  src="$(find "$tmp" -maxdepth 1 -type d -name 'node-v*' | head -n1)"
   [ -n "$src" ] || die "Node.js 包结构异常"
+  local d
   for d in bin include lib share; do
     [ -d "${src}/${d}" ] && cp -a "${src}/${d}/." /usr/local/"${d}"/ 2>/dev/null || true
   done
@@ -171,67 +402,40 @@ install_node() {
   ok "Node.js 安装完成：$(node -v)"
 }
 
-node_ok || install_node
-NODE_BIN="$(command -v node)"
-ok "使用 Node.js $("$NODE_BIN" -v)（${NODE_BIN}）"
+deploy_native() {
+  step "检查运行环境"
+  command -v curl >/dev/null 2>&1 || {
+    info "未找到 curl，尝试自动安装…"
+    if command -v apt-get >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq curl
+    elif command -v dnf >/dev/null 2>&1; then dnf install -y -q curl
+    elif command -v yum >/dev/null 2>&1; then yum install -y -q curl
+    elif command -v apk >/dev/null 2>&1; then apk add --no-cache curl
+    else die "请先手动安装 curl"; fi
+  }
+  command -v tar >/dev/null 2>&1 || die "未找到 tar，请先安装"
 
-# --------------------------------------------------------- 获取程序文件
-step "准备程序文件到 ${INSTALL_DIR}"
+  node_ok || install_node
+  local node_bin
+  node_bin="$(command -v node)"
+  ok "使用 Node.js $("$node_bin" -v)（${node_bin}）"
 
-if [ -d "$INSTALL_DIR/server" ] && [ "$FORCE" != "1" ]; then
-  warn "${INSTALL_DIR}/server 已存在，将就地升级（保留 data 目录）"
-fi
-mkdir -p "$INSTALL_DIR"
+  fetch_files
 
-SRC_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo '')"
-if [ -n "$SRC_DIR" ] && [ -f "${SRC_DIR}/server/src/index.js" ]; then
-  info "来源：本地目录 ${SRC_DIR}"
-  rm -rf "${INSTALL_DIR}/server" "${INSTALL_DIR}/agent" "${INSTALL_DIR}/deploy"
-  cp -a "${SRC_DIR}/server" "$INSTALL_DIR/"
-  [ -d "${SRC_DIR}/agent" ] && cp -a "${SRC_DIR}/agent" "$INSTALL_DIR/"
-  [ -d "${SRC_DIR}/deploy" ] && cp -a "${SRC_DIR}/deploy" "$INSTALL_DIR/"
-  for f in install.sh README.md LICENSE Dockerfile docker-compose.yml; do
-    [ -f "${SRC_DIR}/${f}" ] && cp -a "${SRC_DIR}/${f}" "$INSTALL_DIR/"
-  done
-else
-  info "来源：GitHub ${REPO}@${BRANCH}"
-  tmp="$(mktemp -d)"
-  url="https://codeload.github.com/${REPO}/tar.gz/refs/heads/${BRANCH}"
-  curl -fsSL --retry 3 -o "${tmp}/hera.tar.gz" "$url" || die "下载仓库失败：${url}"
-  tar -xzf "${tmp}/hera.tar.gz" -C "$tmp" || die "解压失败"
-  pkg="$(find "$tmp" -maxdepth 1 -type d -name 'hera-monitor-*' | head -n1)"
-  [ -n "$pkg" ] || die "包结构异常"
-  rm -rf "${INSTALL_DIR}/server" "${INSTALL_DIR}/agent" "${INSTALL_DIR}/deploy"
-  cp -a "${pkg}/server" "$INSTALL_DIR/"
-  [ -d "${pkg}/agent" ] && cp -a "${pkg}/agent" "$INSTALL_DIR/"
-  [ -d "${pkg}/deploy" ] && cp -a "${pkg}/deploy" "$INSTALL_DIR/"
-  for f in install.sh README.md LICENSE Dockerfile docker-compose.yml; do
-    [ -f "${pkg}/${f}" ] && cp -a "${pkg}/${f}" "$INSTALL_DIR/"
-  done
-  rm -rf "$tmp"
-fi
+  step "写入部署配置"
+  info "端口 ${PORT}，监听地址 ${HOST}${PUBLIC_URL:+，公网地址 ${PUBLIC_URL}}"
 
-chmod +x "${INSTALL_DIR}/install.sh" 2>/dev/null || true
-chmod +x "${INSTALL_DIR}/agent/"*.sh 2>/dev/null || true
-mkdir -p "${INSTALL_DIR}/data"
-ok "程序文件就绪"
+  if [ "$NO_SERVICE" = "1" ]; then
+    ok "已跳过服务注册（--no-service）"
+    printf '\n启动方式：\n  HERA_PORT=%s HERA_HOST=%s HERA_DATA_DIR=%s/data HERA_REPO=%s%s \\\n    %s %s/server/src/index.js\n\n' \
+      "$PORT" "$HOST" "$INSTALL_DIR" "$REPO" \
+      "${PUBLIC_URL:+ HERA_PUBLIC_URL=$PUBLIC_URL}" "$node_bin" "$INSTALL_DIR"
+    exit 0
+  fi
 
-# ------------------------------------------------------ 记录仓库地址
-# 面板生成的一键安装命令需要用到这里配置的 GitHub 仓库
-info "仓库地址将写入面板配置：${REPO}（用于生成 Agent 安装命令）"
+  step "注册系统服务"
 
-[ "$NO_SERVICE" = "1" ] && {
-  ok "已跳过服务注册（--no-service）"
-  printf '\n启动方式：\n  HERA_PORT=%s HERA_DATA_DIR=%s/data HERA_REPO=%s %s %s/server/src/index.js\n\n' \
-    "$PORT" "$INSTALL_DIR" "$REPO" "$NODE_BIN" "$INSTALL_DIR"
-  exit 0
-}
-
-# ---------------------------------------------------------------- 服务化
-step "注册系统服务"
-
-start_systemd() {
-  cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
 Description=Hera Monitor - 轻量服务器监控面板
 Documentation=https://github.com/${REPO}
@@ -245,73 +449,156 @@ Environment=HERA_PORT=${PORT}
 Environment=HERA_HOST=${HOST}
 Environment=HERA_DATA_DIR=${INSTALL_DIR}/data
 Environment=HERA_REPO=${REPO}
+${PUBLIC_URL:+Environment=HERA_PUBLIC_URL=${PUBLIC_URL}}
 Environment=NODE_ENV=production
-ExecStart=${NODE_BIN} ${INSTALL_DIR}/server/src/index.js
+ExecStart=${node_bin} ${INSTALL_DIR}/server/src/index.js
 Restart=always
 RestartSec=5
 StandardOutput=append:/var/log/hera-monitor.log
 StandardError=append:/var/log/hera-monitor.log
 NoNewPrivileges=true
 ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
 ReadWritePaths=${INSTALL_DIR}/data /var/log
 
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
-  systemctl restart "$SERVICE_NAME"
-  sleep 2
-  if systemctl is-active --quiet "$SERVICE_NAME"; then
-    ok "systemd 服务已启动并设为开机自启"
-    return 0
+    systemctl daemon-reload
+    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    systemctl restart "$SERVICE_NAME"
+    sleep 2
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+      ok "systemd 服务已启动并设为开机自启"
+    else
+      warn "服务启动失败，查看日志：journalctl -u ${SERVICE_NAME} -n 80"
+    fi
+  else
+    info "未检测到 systemd，使用 nohup 方式启动"
+    mkdir -p /var/log
+    pkill -f "${INSTALL_DIR}/server/src/index.js" >/dev/null 2>&1 || true
+    HERA_PORT="$PORT" HERA_HOST="$HOST" HERA_DATA_DIR="${INSTALL_DIR}/data" \
+      HERA_REPO="$REPO" ${PUBLIC_URL:+HERA_PUBLIC_URL="$PUBLIC_URL"} \
+      nohup "$node_bin" "${INSTALL_DIR}/server/src/index.js" >>/var/log/hera-monitor.log 2>&1 &
+    sleep 2
+    if pgrep -f "${INSTALL_DIR}/server/src/index.js" >/dev/null 2>&1; then
+      ok "已通过 nohup 启动"
+      warn "当前环境无 systemd，进程不会开机自启，请自行配置"
+    else
+      warn "启动失败，日志见 /var/log/hera-monitor.log"
+    fi
   fi
-  warn "服务启动失败，查看日志：journalctl -u ${SERVICE_NAME} -n 80"
-  return 1
+
+  INITIAL_PWD=""
+  [ -f "${INSTALL_DIR}/data/initial-password.txt" ] && INITIAL_PWD="$(cat "${INSTALL_DIR}/data/initial-password.txt")"
+
+  PUBLIC_IP="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || echo '')"
+  print_summary "native" "$PUBLIC_IP" "$INITIAL_PWD"
 }
 
-start_nohup() {
-  mkdir -p /var/log
-  pkill -f "${INSTALL_DIR}/server/src/index.js" >/dev/null 2>&1 || true
-  HERA_PORT="$PORT" HERA_HOST="$HOST" HERA_DATA_DIR="${INSTALL_DIR}/data" HERA_REPO="${REPO}" \
-    nohup "$NODE_BIN" "${INSTALL_DIR}/server/src/index.js" >>/var/log/hera-monitor.log 2>&1 &
-  sleep 2
-  if pgrep -f "${INSTALL_DIR}/server/src/index.js" >/dev/null 2>&1; then
-    ok "已通过 nohup 启动（无 systemd 环境）"
-    warn "当前环境无 systemd，进程不会开机自启，请自行配置开机启动"
-    return 0
+# ---------------------------------------------------------------- 收尾输出
+print_summary() {
+  local mode="$1" public_ip="$2" initial_pwd="$3"
+  local host_ip="${public_ip:-<服务器IP>}"
+
+  printf '\n%s%s%s\n' "$GREEN" "$(printf '═%.0s' {1..62})" "$PLAIN"
+  printf '  %sHera Monitor 部署完成%s   （%s 模式）\n' "$GREEN" "$PLAIN" \
+    "$([ "$mode" = "docker" ] && echo Docker || echo 裸机)"
+  printf '%s%s%s\n' "$GREEN" "$(printf '═%.0s' {1..62})" "$PLAIN"
+  printf '  面板地址    %shttp://%s:%s%s\n' "$CYAN" "$host_ip" "$PORT" "$PLAIN"
+  printf '  安装目录    %s\n' "$INSTALL_DIR"
+  if [ "$mode" = "docker" ]; then
+    if [ "$DEPLOY_KIND" = "run" ]; then
+      printf '  镜像        %s\n' "$IMAGE"
+      printf '  数据卷      hera-data（docker volume inspect hera-data）\n'
+    else
+      printf '  数据卷      %s_hera-data\n' "$(basename "$INSTALL_DIR")"
+    fi
+    printf '  改端口      重跑本脚本：bash %s/install.sh --port <新端口>\n' "$INSTALL_DIR"
+    printf '  日志        docker logs -f %s\n' "$COMPOSE_SERVICE"
+    printf '  排障        bash %s/deploy/troubleshoot.sh --port %s\n' "$INSTALL_DIR" "$PORT"
+    printf '  停止        docker rm -f %s\n' "$COMPOSE_SERVICE"
+  else
+    printf '  数据目录    %s/data\n' "$INSTALL_DIR"
+    printf '  改端口      重跑本脚本：bash %s/install.sh --port <新端口>\n' "$INSTALL_DIR"
+    printf '  日志        tail -f /var/log/hera-monitor.log\n'
+    printf '  服务管理    systemctl {status|restart|stop} %s\n' "$SERVICE_NAME"
   fi
-  warn "启动失败，日志见 /var/log/hera-monitor.log"
-  return 1
+
+  if [ -n "$initial_pwd" ]; then
+    printf '\n  %s管理员初始密码：%s%s\n' "$YELLOW" "$initial_pwd" "$PLAIN"
+    printf '  （登录后请立即在「设置 → 安全」中修改）\n'
+  fi
+
+  printf '\n  %s⚠️  记得在云服务器安全组放行 %s 端口%s\n' "$YELLOW" "$PORT" "$PLAIN"
+  if [ "$mode" = "docker" ]; then
+    printf '     注意：Docker 会绕过 ufw 规则，安全组必须单独放行\n'
+  fi
+
+  printf '\n  在其它服务器上接入 Agent：\n'
+  printf '    curl -fsSL http://%s:%s/install-agent.sh | sudo bash -s -- \\\n' "$host_ip" "$PORT"
+  printf '      --server http://%s:%s --key <密钥>\n' "$host_ip" "$PORT"
+  printf '\n  密钥可在面板「设置」页或「+ 接入新服务器」中复制\n\n'
 }
 
-if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-  start_systemd || true
-else
-  info "未检测到 systemd，使用 nohup 方式启动"
-  start_nohup || true
+# ---------------------------------------------------------------- 主流程
+if [ "$MODE" = "auto" ]; then
+  if docker_usable; then
+    MODE="docker"
+    info "检测到可用的 Docker，使用 Docker 模式（可用 --mode native 强制裸机部署）"
+  else
+    MODE="native"
+    if command -v docker >/dev/null 2>&1; then
+      info "Docker 已安装但当前不可用（守护进程未运行或缺少 Compose），改用裸机模式"
+    else
+      info "未检测到 Docker，使用裸机模式（Node.js + systemd）"
+    fi
+  fi
 fi
 
-# ---------------------------------------------------------------- 收尾
-sleep 1
-PUBLIC_IP="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || echo '')"
+# ---------------------------------------------------------------- 演练模式
+if [ "$DRY_RUN" = "1" ]; then
+  printf '\n%s[演练模式] 以下操作不会真正执行%s\n' "$YELLOW" "$PLAIN"
+  printf '%s\n' "$(printf '─%.0s' {1..62})"
+  printf '  部署方式    %s%s\n' "$MODE" "$([ "$MODE" = "auto" ] && echo '（未解析）' || echo '')"
+  printf '  安装目录    %s\n' "$INSTALL_DIR"
+  printf '  面板端口    %s\n' "$PORT"
+  printf '  监听地址    %s\n' "$HOST"
+  printf '  公网地址    %s\n' "${PUBLIC_URL:-（未设置）}"
+  printf '  仓库        %s@%s\n' "$REPO" "$BRANCH"
 
-printf '\n%s%s%s\n' "$GREEN" "$(printf '═%.0s' {1..58})" "$PLAIN"
-printf '  %sHera Monitor 部署完成%s\n' "$GREEN" "$PLAIN"
-printf '%s%s%s\n' "$GREEN" "$(printf '═%.0s' {1..58})" "$PLAIN"
-printf '  面板地址    %shttp://%s:%s%s\n' "$CYAN" "${PUBLIC_IP:-<服务器IP>}" "$PORT" "$PLAIN"
-printf '  安装目录    %s\n' "$INSTALL_DIR"
-printf '  数据目录    %s/data\n' "$INSTALL_DIR"
-printf '  日志        tail -f /var/log/hera-monitor.log\n'
-printf '  服务管理    systemctl {status|restart|stop} %s\n' "$SERVICE_NAME"
+  if [ "$MODE" = "docker" ]; then
+    detect_compose && printf '  Compose     %s\n' "$COMPOSE"
+    if [ -n "$IMAGE" ]; then
+      printf '  镜像        %s（不本地构建）\n' "$IMAGE"
+      printf '  将执行      docker run -d --name %s --init -p %s:%s:8080 -v hera-data:/data %s\n' \
+        "$COMPOSE_SERVICE" "$HOST" "$PORT" "$IMAGE"
+    else
+      printf '  端口映射    %s:%s:8080   （宿主机:端口:容器）\n' "$HOST" "$PORT"
+      printf '  将写入      %s/.env\n' "$INSTALL_DIR"
+      printf '                HERA_PORT=%s\n' "$PORT"
+      printf '                HERA_BIND=%s\n' "$HOST"
+      [ -n "$PUBLIC_URL" ] && printf '                HERA_PUBLIC_URL=%s\n' "$PUBLIC_URL"
+      printf '  将执行      cd %s && %s up -d --build\n' "$INSTALL_DIR" "${COMPOSE:-docker compose}"
+    fi
+  else
+    printf '  Node.js     %s\n' "$(node -v 2>/dev/null || echo '未安装 → 将自动安装 22.x')"
+    printf '  将注册      /etc/systemd/system/%s.service\n' "$SERVICE_NAME"
+    printf '                HERA_PORT=%s  HERA_HOST=%s  HERA_DATA_DIR=%s/data\n' "$PORT" "$HOST" "$INSTALL_DIR"
+    printf '  将执行      systemctl enable --now %s\n' "$SERVICE_NAME"
+  fi
 
-if [ -f "${INSTALL_DIR}/data/initial-password.txt" ]; then
-  printf '\n  %s管理员初始密码：%s%s\n' "$YELLOW" "$(cat "${INSTALL_DIR}/data/initial-password.txt")" "$PLAIN"
-  printf '  （登录后请立即在「设置 → 安全」中修改）\n'
+  printf '\n  访问地址    http://<服务器IP>:%s\n' "$PORT"
+  printf '%s\n\n' "$(printf '─%.0s' {1..62})"
+  if [ "$MODE" = "auto" ]; then
+    warn "auto 模式需要在目标机器上探测 Docker，演练模式下无法确定最终方式"
+    warn "用 --mode docker 或 --mode native 明确指定即可看到完整计划"
+  fi
+  exit 0
 fi
 
-printf '\n  %s别忘了在安全组/防火墙放行 %s 端口%s\n' "$YELLOW" "$PORT" "$PLAIN"
-printf '\n  在其它服务器上接入 Agent：\n'
-printf '    curl -fsSL http://%s:%s/install-agent.sh | sudo bash -s -- --server http://%s:%s --key <密钥>\n' \
-  "${PUBLIC_IP:-<服务器IP>}" "$PORT" "${PUBLIC_IP:-<服务器IP>}" "$PORT"
-printf '\n  密钥可在面板「设置」页或「+ 接入新服务器」中复制\n\n'
+case "$MODE" in
+  docker) deploy_docker ;;
+  native) deploy_native ;;
+esac

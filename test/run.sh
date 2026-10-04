@@ -32,6 +32,15 @@ HERA_PORT="$PORT" HERA_HOST=127.0.0.1 HERA_DATA_DIR="$DATA_DIR" \
   "$NODE_BIN" "$ROOT/server/src/index.js" > "$LOG" 2>&1 &
 SERVER_PID=$!
 
+# install.sh 的参数测试（纯本地，不依赖上面的服务端）
+echo ""
+bash "$ROOT/test/install-args.sh"
+ARGS_CODE=$?
+if [ "$ARGS_CODE" -ne 0 ]; then
+  echo "[test] install.sh 参数测试未通过"
+fi
+echo ""
+
 for _ in $(seq 1 40); do
   if curl -fsS --noproxy '*' "http://127.0.0.1:${PORT}/api/health" > /dev/null 2>&1; then
     break
@@ -52,5 +61,11 @@ fi
 
 HERA_TEST_BASE="http://127.0.0.1:${PORT}" HERA_TEST_DATA="$DATA_DIR" "$NODE_BIN" "$ROOT/test/e2e.js"
 CODE=$?
+
+# 任一环节失败，整体就算失败
+if [ "$ARGS_CODE" -ne 0 ] && [ "$CODE" -eq 0 ]; then
+  CODE=$ARGS_CODE
+fi
+
 echo "[test] 退出码：$CODE"
 exit $CODE

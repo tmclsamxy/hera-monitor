@@ -49,8 +49,8 @@
 | 🔔 **多渠道告警** | Webhook / Telegram / 钉钉 / 飞书 / Bark / Server 酱 / Gotify；支持阈值、持续时长、指定服务器、冷却时间 |
 | 🏷 **服务器管理** | 分组、标签、地区、备注、价格、到期日、自定义排序 |
 | 🔒 **安全** | 随机初始密码、HMAC 签名会话、登录限流、路径穿越防护、Agent 密钥可轮换、时序数据裁剪 |
-| 📦 **一键部署** | `docker compose up -d` 即可跑起来；另有 `install.sh` 自动装 Node + 注册 systemd。提供多架构镜像与容器排障脚本 |
-| 🔍 **可排障** | 启动时自检并打印实际监听地址 / 数据目录可写性 / 静态资源状态；异常请求必定返回响应而不会挂死 |
+| 📦 **一键部署** | `install.sh --port 9000` 一步到位：自动选 Docker 或 systemd、支持自定义端口 / 监听地址 / 公网地址，带 `--dry-run` 演练 |
+| 🔍 **可排障** | 启动时自检并打印实际监听地址 / 数据目录可写性 / 静态资源状态；异常请求必定返回响应而不会挂死；附带容器排障脚本 |
 | 🪶 **轻量** | 单进程常驻内存约 40MB；Agent 常驻内存 < 3MB |
 
 ---
@@ -68,13 +68,53 @@ docker compose logs -f        # 首次启动会打印管理员初始密码
 
 浏览器打开 `http://服务器IP:8080` 即可登录。
 
-改端口：`cp .env.example .env`，编辑 `HERA_PORT` 后重新 `docker compose up -d`。
+#### 自定义端口（推荐用部署脚本）
+
+不想手动改配置，就用带 `--port` 的安装脚本，它会自动检测 Docker 并写下 `.env`：
+
+```bash
+# 端口 9000
+sudo bash install.sh --port 9000
+
+# 端口 9000，且只允许本机访问（前面挂 Nginx 反代）
+sudo bash install.sh --port 9000 --host 127.0.0.1
+
+# 走域名，让面板生成的一键接入命令自动使用该域名
+sudo bash install.sh --port 9000 --public-url https://monitor.example.com
+
+# 先演练一遍，看清会做什么改动（不改动任何东西）
+sudo bash install.sh --dry-run --port 9000
+
+# 远程一行搞定
+curl -fsSL https://raw.githubusercontent.com/tmclsamxy/hera-monitor/main/install.sh \
+  | sudo bash -s -- --port 9000
+```
+
+完整参数见 `sudo bash install.sh --help`。常用项：
+
+| 参数 | 说明 |
+|---|---|
+| `--port PORT` | 面板对外端口，默认 `8080`，**两种模式都生效** |
+| `--host HOST` | 监听地址。默认 `0.0.0.0`；填 `127.0.0.1` 则只允许本机访问 |
+| `--public-url URL` | 面板公网地址，填了之后一键接入命令会用它 |
+| `--mode auto\|docker\|native` | 部署方式，`auto` 会优先用 Docker |
+| `--image IMAGE` | 用预构建镜像，不本地构建 |
+| `--dir DIR` | 安装目录，默认 `/opt/hera-monitor` |
+| `--dry-run` | 只打印计划，不做改动 |
+| `--uninstall` | 卸载（数据默认保留） |
+
+**手动改端口**的话：`cp .env.example .env`，编辑 `HERA_PORT` 后重新 `docker compose up -d` 即可
+（Compose 会检测到端口映射变化并自动重建容器）。
+
+> 容器内部始终监听 8080，`--port` 改的是宿主机映射出来的端口，不影响容器内配置。
 
 **免构建、直接用预构建镜像**（需要能访问 ghcr.io）：
 
 ```bash
+sudo bash install.sh --port 9000 --image ghcr.io/tmclsamxy/hera-monitor:latest
+# 等价于
 docker run -d --name hera-monitor --init --restart unless-stopped \
-  -p 8080:8080 -v hera-data:/data \
+  -p 9000:8080 -v hera-data:/data \
   ghcr.io/tmclsamxy/hera-monitor:latest
 ```
 
@@ -88,7 +128,8 @@ docker run -d --name hera-monitor --init --restart unless-stopped \
 **2）跑一下排障脚本**，它会逐项定位问题并给出修复命令：
 
 ```bash
-bash deploy/troubleshoot.sh
+bash deploy/troubleshoot.sh                 # 默认检查 8080
+bash deploy/troubleshoot.sh --port 9000     # 自定义端口时加上
 ```
 
 脚本会依次检查：容器是否运行 → 容器内 `/api/health` 是否正常 → **服务实际监听的地址** →
@@ -115,15 +156,20 @@ bash deploy/troubleshoot.sh
 在**一台**服务器上执行（Debian / Ubuntu / CentOS / RHEL / Alma / Rocky / Alpine / Arch 均可）：
 
 ```bash
-# 方式 A：从仓库直接部署
+# 自动模式：有 Docker 就用 Docker，没有就走裸机 + systemd
 curl -fsSL https://raw.githubusercontent.com/tmclsamxy/hera-monitor/main/install.sh | sudo bash
 
-# 方式 B：已克隆仓库，本地部署
-cd hera-monitor && sudo bash install.sh
+# 强制裸机模式，并把端口改成 9000
+sudo bash install.sh --mode native --port 9000
+
+# 已克隆仓库的本地部署
+cd hera-monitor && sudo bash install.sh --port 9000
 ```
 
 脚本会自动完成：检测/安装 Node.js → 拷贝程序到 `/opt/hera-monitor` → 注册 systemd 服务 → 启动。
 启动后会打印**管理员初始密码**（也写入 `data/initial-password.txt`）。
+
+改端口随时可以重跑：`sudo bash /opt/hera-monitor/install.sh --port 9000`。
 
 ### 三、接入被监控服务器
 
@@ -178,12 +224,13 @@ hera-monitor/
 ├── .github/workflows/
 │   └── docker-publish.yml   # 自动构建多架构镜像推送到 GHCR
 ├── test/
-│   ├── run.sh               # 在临时实例上跑端到端测试
-│   └── e2e.js               # 65 项断言
+│   ├── run.sh               # 一键跑全部测试（自起临时实例）
+│   ├── e2e.js               # 服务端端到端 65 项断言
+│   └── install-args.sh      # install.sh 参数与演练模式 26 项断言
 ├── Dockerfile
 ├── docker-compose.yml       # 主推部署方式
-├── .env.example             # 端口 / 绑定地址配置
-└── install.sh               # 裸机一键部署（systemd）
+├── .env.example             # 端口 / 绑定地址 / 公网地址
+└── install.sh               # 一键部署（自动选 Docker 或 systemd）
 ```
 
 ---
@@ -264,9 +311,15 @@ journalctl -u hera-agent -n 50
 `data/metrics/*.jsonl` 按服务器分文件追加，默认保留 7 天（面板可改），每 6 小时自动裁剪一次。
 Docker 部署下数据在 `hera-data` 命名卷里，`docker volume inspect hera-data` 可查实际路径。
 
+**Q：怎么改端口？**
+推荐直接重跑安装脚本，两种模式都生效：`sudo bash /opt/hera-monitor/install.sh --port 9000`。
+Docker 手动改则是编辑 `.env` 的 `HERA_PORT` 后 `docker compose up -d`（Compose 会自动重建容器）。
+改完记得在安全组同步放行新端口，并重新生成 Agent 安装命令（面板里的地址会跟着变）。
+
 **Q：想用域名 + HTTPS？**
-用 Nginx/Caddy 反代到 `127.0.0.1:8080`，把 `.env` 里的 `HERA_BIND` 改成 `127.0.0.1`（只允许本机访问），
-然后在面板「设置 → 面板公网地址」填写域名，一键安装命令会自动使用该地址。参考 `deploy/nginx.conf`。
+用 Nginx/Caddy 反代到 `127.0.0.1:8080`，部署时加 `--host 127.0.0.1`（只允许本机访问），
+再用 `--public-url https://monitor.example.com` 让一键接入命令自动使用该域名。
+参考 `deploy/nginx.conf`。
 
 ---
 
@@ -280,14 +333,24 @@ cd hera-monitor
 node server/src/index.js          # 默认 http://localhost:8080
 ```
 
-跑一遍端到端测试（会自动起一个临时实例，不碰你的正式数据）：
+跑一遍全部测试（会自动起一个临时实例，不碰你的正式数据）：
 
 ```bash
 bash test/run.sh
 ```
 
-覆盖健康检查、静态资源、鉴权、登录限流、Agent 注册与上报、指标降采样、站点监控探测、
-告警触发与推送、密钥轮换、SSE 推送、异常与边界共 56 项断言。
+两个测试文件共 **91 项断言**：
+
+| 文件 | 断言数 | 覆盖范围 |
+|---|---|---|
+| `test/e2e.js` | 65 | 健康检查、静态资源、鉴权、登录限流、Agent 注册与上报、指标降采样、站点监控探测、告警触发与推送、密钥轮换、SSE 推送、异常与边界、**异常请求不得挂死** |
+| `test/install-args.sh` | 26 | `install.sh` 参数校验（端口范围、mode、绝对路径）、`--help` 完整性、`--dry-run` 演练输出、演练零副作用 |
+
+单独跑参数测试（不需要 Node，秒级完成）：
+
+```bash
+bash test/install-args.sh
+```
 
 Agent 本地排障（任何 Linux 机器上都能跑，不需要服务端）：
 
