@@ -22,7 +22,9 @@ import {
 } from './util.js';
 
 const VERSION = '1.0.0';
-const PORT = Number(process.env.HERA_PORT || process.env.PORT || 8080);
+const PORT = Number(process.env.HERA_PORT || process.env.PORT || 8080) || 8080;
+// 默认监听所有网卡。容器里必须绑 0.0.0.0（或 ::），
+// 否则 Docker 的端口映射无法把外部流量转发进来。
 const HOST = process.env.HERA_HOST || '0.0.0.0';
 
 loadConfig();
@@ -214,6 +216,7 @@ const route = (method, pattern, handler, opts = {}) => {
 /* --- 公开接口 --- */
 
 route('GET', '/api/health', async (ctx) => {
+  const addr = server.address();
   sendJSON(ctx.res, 200, {
     ok: true,
     version: VERSION,
@@ -221,6 +224,11 @@ route('GET', '/api/health', async (ctx) => {
     servers: state.servers.size,
     monitors: state.monitors.size,
     time: now(),
+    // 自检信息：容器里排查「端口映射不通」时最有用
+    listen: addr && typeof addr === 'object'
+      ? { address: addr.address, port: addr.port, family: addr.family }
+      : { address: HOST, port: PORT },
+    dataDir: DATA_DIR,
   });
 }, { auth: false });
 
@@ -570,7 +578,15 @@ route('POST', '/api/key/rotate', async (ctx) => {
 /* ------------------------------------------------------------ 静态资源 */
 
 function serveStatic(req, res, pathname) {
-  let rel = decodeURIComponent(pathname);
+  let rel;
+  try {
+    rel = decodeURIComponent(pathname);
+  } catch {
+    // 畸形百分号编码（如 /%）会抛异常，必须就地拦掉
+    res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Bad Request');
+    return;
+  }
   if (rel === '/' || rel === '') rel = '/index.html';
   const full = path.resolve(PUBLIC_DIR, `.${rel}`);
   if (!full.startsWith(PUBLIC_DIR)) {
@@ -600,14 +616,53 @@ function serveStatic(req, res, pathname) {
       'Cache-Control': noCache ? 'no-cache' : 'public, max-age=86400',
       'Content-Length': st.size,
     });
-    fs.createReadStream(full).pipe(res);
+    // 文件在读取过程中被删除时，'error' 事件不处理会直接冒泡成未捕获异常
+    const stream = fs.createReadStream(full);
+    stream.on('error', () => {
+      if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end();
+    });
+    stream.pipe(res);
   });
 }
 
 /* ---------------------------------------------------------------- 主循环 */
 
+/**
+ * 最外层兜底。
+ *
+ * 这里是本项目最关键的错误处理：如果请求处理过程中抛出任何未预料的异常，
+ * 而进程又装了 uncaughtException 处理器（不会退出），那么 socket 会一直挂着
+ * 不返回 —— 表现就是「lsof 看进程在正常监听，但页面死活打不开」。
+ * 容器健康检查、端口扫描器、畸形 URL 都很容易触发这类异常。
+ * 因此无论发生什么，都必须给客户端一个响应。
+ */
 async function handle(req, res) {
-  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  try {
+    await routeRequest(req, res);
+  } catch (e) {
+    console.error(`[request-error] ${req.method} ${req.url} ->`, e);
+    try {
+      if (!res.headersSent) {
+        sendJSON(res, 500, { ok: false, error: `服务器内部错误：${e.message}` });
+      } else {
+        res.end();
+      }
+    } catch { /* 连接已断开，忽略 */ }
+  }
+}
+
+async function routeRequest(req, res) {
+  // 只用于解析 pathname / query，因此不依赖 Host 头 ——
+  // 畸形 Host（空值、带空格、被伪造）不应影响正常路由，更不该让请求挂死。
+  let url;
+  try {
+    url = new URL(req.url, 'http://hera.local');
+  } catch {
+    res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Bad Request');
+    return;
+  }
   const pathname = url.pathname;
 
   if (pathname.startsWith('/api/') || pathname.startsWith('/install-agent.sh') || pathname.startsWith('/agent/')) {
@@ -673,23 +728,90 @@ const server = http.createServer(handle);
 server.keepAliveTimeout = 65000;
 server.headersTimeout = 70000;
 
-server.listen(PORT, HOST, () => {
+// 畸形请求（非法 Host、超长 header、非 HTTP 协议探测）不应该让进程静默挂住
+server.on('clientError', (err, socket) => {
+  if (!socket.writable || err.code === 'ECONNRESET' || !err.rawPacket) {
+    socket.destroy();
+    return;
+  }
+  socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+});
+
+/** 启动自检：把「进程活着但访问不到」这类问题在启动日志里就说清楚 */
+function startupReport() {
+  const addr = server.address();
+  const boundAddr = addr && typeof addr === 'object' ? addr.address : HOST;
+  const boundPort = addr && typeof addr === 'object' ? addr.port : PORT;
+  const loopback = ['127.0.0.1', '::1', 'localhost'].includes(boundAddr);
+
+  const problems = [];
+  if (loopback) {
+    problems.push(`只监听了回环地址 ${boundAddr}。容器中这会导致 Docker 端口映射无法转发流量，请把 HERA_HOST 设为 0.0.0.0`);
+  }
+  let dataWritable = true;
+  try {
+    fs.accessSync(DATA_DIR, fs.constants.W_OK);
+  } catch {
+    dataWritable = false;
+    problems.push(`数据目录 ${DATA_DIR} 不可写，配置与指标无法保存`);
+  }
+  const assets = ['index.html', 'app.js', 'style.css'];
+  const missing = assets.filter((f) => !fs.existsSync(path.join(PUBLIC_DIR, f)));
+  if (missing.length) {
+    problems.push(`面板静态资源缺失：${missing.join(', ')}（目录 ${PUBLIC_DIR}）`);
+  }
+
   const cfg = config();
-  const line = '─'.repeat(56);
+  const line = '─'.repeat(62);
   console.log(`\n${line}`);
   console.log(`  Hera Monitor  v${VERSION}`);
   console.log(line);
-  console.log(`  面板地址   http://localhost:${PORT}`);
-  console.log(`  数据目录   ${DATA_DIR}`);
+  console.log(`  监听地址   ${boundAddr}:${boundPort}${loopback ? '   ⚠️ 仅本机可访问' : '   ✓ 所有网卡'}`);
+  console.log(`  数据目录   ${DATA_DIR}${dataWritable ? '   ✓ 可写' : '   ✗ 不可写'}`);
+  console.log(`  面板资源   ${PUBLIC_DIR}   ${missing.length ? '✗ 缺失' : '✓ 就绪'}`);
+  console.log(`  访问地址   http://<服务器IP>:${boundPort}`);
+
   if (cfg.__initialPassword) {
     console.log(`\n  ⚠️  首次启动，管理员初始密码：${cfg.__initialPassword}`);
-    console.log('     （已写入 data/initial-password.txt，请登录后立即修改）');
+    console.log(`     （已写入 ${path.join(DATA_DIR, 'initial-password.txt')}，请登录后立即修改）`);
   }
-  console.log(`\n  一键接入 Agent：`);
-  console.log(`  curl -fsSL <本机地址>:${PORT}/install-agent.sh | bash -s -- --server http://<本机地址>:${PORT} --key ${cfg.agentKey}`);
+
+  console.log(`\n  接入 Agent：`);
+  console.log(`  curl -fsSL http://<服务器IP>:${boundPort}/install-agent.sh | sudo bash -s -- --server http://<服务器IP>:${boundPort} --key ${cfg.agentKey}`);
+
+  if (problems.length) {
+    console.log(`\n  ${'!'.repeat(58)}`);
+    for (const p of problems) console.log(`  [警告] ${p}`);
+    console.log(`  ${'!'.repeat(58)}`);
+  }
+
+  console.log(`\n  打不开面板？按顺序排查：`);
+  console.log(`    1. 云服务器安全组 / 本机防火墙是否放行了 ${boundPort} 端口`);
+  console.log(`    2. docker compose ps          查看容器状态是否 healthy`);
+  console.log(`    3. 容器内自测                  docker compose exec hera-monitor node -e "fetch('http://127.0.0.1:${boundPort}/api/health').then(r=>r.text()).then(console.log)"`);
+  console.log(`    4. 看服务端日志                docker compose logs -f hera-monitor`);
   console.log(`${line}\n`);
   loadConfig(); // 清理掉 __initialPassword 的内存引用
+}
+
+server.on('error', (e) => {
+  const line = '─'.repeat(62);
+  console.error(`\n${line}`);
+  if (e.code === 'EADDRINUSE') {
+    console.error(`  [致命] 端口 ${PORT} 已被占用，无法启动。`);
+    console.error('  查看占用：ss -lntp | grep ' + PORT);
+  } else if (e.code === 'EACCES') {
+    console.error(`  [致命] 没有权限绑定端口 ${PORT}（1024 以下端口需要 root）。`);
+  } else if (e.code === 'EADDRNOTAVAIL') {
+    console.error(`  [致命] 监听地址 ${HOST} 在本机不存在。容器里请使用 HERA_HOST=0.0.0.0`);
+  } else {
+    console.error(`  [致命] 服务启动失败：${e.message}`);
+  }
+  console.error(`${line}\n`);
+  process.exit(1);
 });
+
+server.listen(PORT, HOST, startupReport);
 
 /* ------------------------------------------------------------ 定时任务 */
 
@@ -732,6 +854,13 @@ process.on('SIGINT', () => {
 });
 
 process.on('uncaughtException', (e) => {
-  console.error('[uncaught]', e);
+  console.error('[uncaughtException]', e);
   try { logEvent('system', `未捕获异常：${e.message}`); } catch { /* ignore */ }
+});
+
+// 未处理的 Promise 拒绝同样要留痕，否则会变成「进程活着但请求不响应」的隐形故障
+process.on('unhandledRejection', (reason) => {
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  console.error('[unhandledRejection]', reason);
+  try { logEvent('system', `未处理的 Promise 拒绝：${msg}`); } catch { /* ignore */ }
 });

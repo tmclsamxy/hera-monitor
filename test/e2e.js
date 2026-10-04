@@ -14,6 +14,7 @@ const BASE = (process.env.HERA_TEST_BASE || 'http://127.0.0.1:18099').replace(/\
 const DATA = process.env.HERA_TEST_DATA || path.resolve(__dirname, '..', 'data');
 const pwFile = path.join(DATA, 'initial-password.txt');
 const cfgFile = path.join(DATA, 'config.json');
+const PORT = Number(new URL(BASE).port || 80);
 
 let token = '';
 let pass = 0; let fail = 0;
@@ -138,14 +139,14 @@ function report(hostname, id, cpu, memUsedPct, rx, tx) {
   ok('新增 HTTP 监控', r.data.ok === true);
   r = await api('/api/monitors', { method: 'POST', body: { name: '无效目标', type: 'http', target: 'not-a-url' } });
   ok('非法目标被拒绝', r.status === 400, r.data.error);
-  r = await api('/api/monitors', { method: 'POST', body: { name: '淘宝 443', type: 'tcp', target: '127.0.0.1:18080', interval: 10 } });
+  r = await api('/api/monitors', { method: 'POST', body: { name: '本地端口探测', type: 'tcp', target: `127.0.0.1:${PORT}`, interval: 10 } });
   ok('新增 TCP 监控', r.data.ok === true);
 
   await new Promise((s) => setTimeout(s, 4000));
   r = await api('/api/bootstrap');
   const mons = r.data.overview.monitors;
   const selfMon = mons.find((m) => m.name === '面板自身');
-  const tcpMon = mons.find((m) => m.name === '淘宝 443');
+  const tcpMon = mons.find((m) => m.name === '本地端口探测');
   ok('HTTP 探测成功', selfMon?.ok === true, `${selfMon?.ms}ms / HTTP ${selfMon?.code}`);
   ok('TCP 探测成功', tcpMon?.ok === true, `${tcpMon?.ms}ms`);
   ok('可用率统计', selfMon?.uptime24 >= 0, `${selfMon?.uptime24}%`);
@@ -249,6 +250,48 @@ function report(hostname, id, cpu, memUsedPct, rx, tx) {
   ok('未知接口返回 404', r.status === 404);
   r = await api('/../../etc/passwd', { raw: true });
   ok('路径穿越被拦截', r.status !== 200 || !r.text.includes('root:'), `status=${r.status}`);
+
+  // —— 回归测试：任何异常请求都必须给出响应，绝不能挂死 ——
+  // 历史问题：handle() 是 async 但没有全局 try/catch，配合只记日志不退出进程的
+  // uncaughtException 处理器，异常会让 socket 永远挂着 ——
+  // 表现就是「lsof 看进程正常监听，但页面死活打不开」。
+  const httpMod = require('node:http');
+  const rawReq = (name, path, { method = 'GET', headers = {} } = {}) => new Promise((resolve) => {
+    const started = Date.now();
+    const req = httpMod.request({
+      host: '127.0.0.1', port: PORT, path, method, headers,
+    }, (res) => {
+      res.resume();
+      res.on('end', () => {
+        ok(name, true, `HTTP ${res.statusCode} / ${Date.now() - started}ms`);
+        resolve();
+      });
+    });
+    req.setTimeout(5000, () => {
+      ok(name, false, '请求挂死（5 秒无任何响应）');
+      req.destroy();
+      resolve();
+    });
+    req.on('error', (e) => {
+      ok(name, true, `连接级错误但未挂死：${e.code || e.message}`);
+      resolve();
+    });
+    req.end();
+  });
+
+  await rawReq('畸形百分号编码 /% 不挂死', '/%');
+  await rawReq('截断的 UTF-8 编码不挂死', '/%E0%A4%A');
+  await rawReq('超长路径不挂死', `/${'a'.repeat(4000)}`);
+  await rawReq('非法 Host 头不挂死', '/api/health', { headers: { Host: 'a b c' } });
+  await rawReq('不存在的方法不挂死', '/api/health', { method: 'PATCH' });
+  await rawReq('超长 URL 不挂死', `/${'x'.repeat(8000)}?${'y'.repeat(8000)}`);
+
+  // 健康检查要暴露真实监听地址，用于排查容器端口映射问题
+  r = await api('/api/health');
+  ok('/api/health 暴露监听地址', typeof r.data.listen?.address === 'string' && r.data.listen.address.length > 0,
+    `${r.data.listen?.address}:${r.data.listen?.port}`);
+  ok('/api/health 暴露数据目录', typeof r.data.dataDir === 'string' && r.data.dataDir.length > 0, r.data.dataDir);
+  ok('自检端口与实际监听一致', Number(r.data.listen?.port) === PORT, `自检=${r.data.listen?.port} 实际=${PORT}`);
 
   r = await api('/api/bootstrap');
   ok('默认分组与排序正常', r.data.overview.servers.length > 0);

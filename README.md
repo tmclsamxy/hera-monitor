@@ -49,14 +49,68 @@
 | 🔔 **多渠道告警** | Webhook / Telegram / 钉钉 / 飞书 / Bark / Server 酱 / Gotify；支持阈值、持续时长、指定服务器、冷却时间 |
 | 🏷 **服务器管理** | 分组、标签、地区、备注、价格、到期日、自定义排序 |
 | 🔒 **安全** | 随机初始密码、HMAC 签名会话、登录限流、路径穿越防护、Agent 密钥可轮换、时序数据裁剪 |
-| 📦 **一键部署** | `install.sh` 自动装 Node + 注册 systemd；也提供 Docker / docker-compose |
+| 📦 **一键部署** | `docker compose up -d` 即可跑起来；另有 `install.sh` 自动装 Node + 注册 systemd。提供多架构镜像与容器排障脚本 |
+| 🔍 **可排障** | 启动时自检并打印实际监听地址 / 数据目录可写性 / 静态资源状态；异常请求必定返回响应而不会挂死 |
 | 🪶 **轻量** | 单进程常驻内存约 40MB；Agent 常驻内存 < 3MB |
 
 ---
 
 ## 🚀 快速开始
 
-### 一、部署服务端
+### 一、部署服务端（Docker，推荐）
+
+```bash
+git clone https://github.com/tmclsamxy/hera-monitor.git
+cd hera-monitor
+docker compose up -d
+docker compose logs -f        # 首次启动会打印管理员初始密码
+```
+
+浏览器打开 `http://服务器IP:8080` 即可登录。
+
+改端口：`cp .env.example .env`，编辑 `HERA_PORT` 后重新 `docker compose up -d`。
+
+**免构建、直接用预构建镜像**（需要能访问 ghcr.io）：
+
+```bash
+docker run -d --name hera-monitor --init --restart unless-stopped \
+  -p 8080:8080 -v hera-data:/data \
+  ghcr.io/tmclsamxy/hera-monitor:latest
+```
+
+镜像由 GitHub Actions 自动构建，支持 `linux/amd64` 与 `linux/arm64`（含 Apple Silicon 与 ARM 服务器）。
+
+#### ⚠️ 部署后打不开？先看这两条
+
+**1）云服务器必须在「安全组」里放行端口。**
+这是最常见的原因。注意 Docker 的端口发布**不受 ufw 规则约束**——即使 `ufw allow 8080` 了也可能依然不通，安全组必须单独放行。
+
+**2）跑一下排障脚本**，它会逐项定位问题并给出修复命令：
+
+```bash
+bash deploy/troubleshoot.sh
+```
+
+脚本会依次检查：容器是否运行 → 容器内 `/api/health` 是否正常 → **服务实际监听的地址** →
+宿主机端口是否发布 → 宿主机回环能否访问 → 公网 IP 能否访问 → ufw/firewalld/iptables 状态，
+最后打印结论。示例输出：
+
+```
+3/7 容器内部监听地址（关键）
+  ✓ 容器内 /api/health 正常，实际监听于 0.0.0.0:8080
+  ✓ 监听所有网卡，端口映射可以正常转发
+5/7 宿主机本地访问
+  ✓ http://127.0.0.1:8080 返回 200
+6/7 公网地址访问
+  ✗ 本机 127.0.0.1:8080 通，但公网 1.2.3.4:8080 不通
+  ! 这基本可以确定是【云服务器安全组】或【系统防火墙】没放行 8080 端口
+```
+
+> 💡 生产环境建议用 Nginx / Caddy 反代并开启 HTTPS（配置示例见 `deploy/nginx.conf`）。
+> 反代时记得关闭 SSE 缓冲：`proxy_buffering off;`（示例配置已包含）。
+> 反代场景把 `HERA_BIND` 设为 `127.0.0.1`，只允许本机访问更安全。
+
+### 二、部署服务端（裸机 / systemd，不想用 Docker 时）
 
 在**一台**服务器上执行（Debian / Ubuntu / CentOS / RHEL / Alma / Rocky / Alpine / Arch 均可）：
 
@@ -65,26 +119,13 @@
 curl -fsSL https://raw.githubusercontent.com/tmclsamxy/hera-monitor/main/install.sh | sudo bash
 
 # 方式 B：已克隆仓库，本地部署
-git clone https://github.com/tmclsamxy/hera-monitor.git
 cd hera-monitor && sudo bash install.sh
 ```
 
 脚本会自动完成：检测/安装 Node.js → 拷贝程序到 `/opt/hera-monitor` → 注册 systemd 服务 → 启动。
+启动后会打印**管理员初始密码**（也写入 `data/initial-password.txt`）。
 
-启动后会打印**管理员初始密码**（也写入 `data/initial-password.txt`）。浏览器打开 `http://服务器IP:8080` 即可登录。
-
-**Docker 部署（任选）：**
-
-```bash
-docker compose up -d
-# 或
-docker run -d --name hera-monitor -p 8080:8080 -v hera-data:/data --restart unless-stopped ghcr.io/tmclsamxy/hera-monitor:latest
-```
-
-> 💡 生产环境建议用 Nginx / Caddy 反代并开启 HTTPS（配置示例见 `deploy/nginx.conf`）。
-> 反代时记得关闭 SSE 缓冲：`proxy_buffering off;`（本项目的示例配置已包含）。
-
-### 二、接入被监控服务器
+### 三、接入被监控服务器
 
 登录面板 → 右上角 **「+ 接入新服务器」**，复制那一条命令，在目标服务器上以 root 执行：
 
@@ -131,11 +172,18 @@ hera-monitor/
 │   ├── hera-agent.sh        # Agent 本体（纯 bash）
 │   └── install.sh           # Agent 一键安装脚本
 ├── deploy/
-│   ├── nginx.conf           # 反代配置示例
-│   └── hera-monitor.service # systemd 单元参考
+│   ├── nginx.conf           # 反代配置示例（含 SSE 免缓冲）
+│   ├── hera-monitor.service # systemd 单元参考
+│   └── troubleshoot.sh      # 容器部署一键排障（只读）
+├── .github/workflows/
+│   └── docker-publish.yml   # 自动构建多架构镜像推送到 GHCR
+├── test/
+│   ├── run.sh               # 在临时实例上跑端到端测试
+│   └── e2e.js               # 65 项断言
 ├── Dockerfile
-├── docker-compose.yml
-└── install.sh               # 服务端一键部署
+├── docker-compose.yml       # 主推部署方式
+├── .env.example             # 端口 / 绑定地址配置
+└── install.sh               # 裸机一键部署（systemd）
 ```
 
 ---
@@ -147,8 +195,10 @@ hera-monitor/
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `HERA_PORT` | `8080` | 监听端口（也兼容 `PORT`） |
-| `HERA_HOST` | `0.0.0.0` | 监听地址 |
+| `HERA_HOST` | `0.0.0.0` | 监听地址。**容器里必须保持 `0.0.0.0`**，否则端口映射无法转发 |
 | `HERA_DATA_DIR` | `../data` | 数据目录，Docker 中为 `/data` |
+| `HERA_REPO` | — | 仓库地址，部署脚本注入，用于生成 Agent 安装命令 |
+| `HERA_PUBLIC_URL` | — | 面板公网地址，走域名反代时设置 |
 
 Agent 通过命令行参数或 `/etc/hera-agent.conf` 配置，另支持：
 
@@ -189,8 +239,20 @@ journalctl -u hera-agent -n 50
 
 ## 🛠 常见问题
 
-**Q：面板打不开 / Agent 上报失败？**
-检查安全组是否放行了面板端口；确认 `--server` 用的是 Agent 能访问到的地址（不要写 `localhost`）。
+**Q：Docker 部署后面板打不开，但 `lsof` / `ss` 看端口是正常监听的？**
+按这个顺序排查（`bash deploy/troubleshoot.sh` 会自动跑完并给结论）：
+
+1. **容器内服务是否只监听回环地址** —— 若 `HERA_HOST` 不是 `0.0.0.0`，端口映射无法转发。
+   在宿主机执行 `docker compose exec hera-monitor node -e "fetch('http://127.0.0.1:8080/api/health').then(r=>r.json()).then(j=>console.log(j.listen))"`，
+   正常应输出 `{ address: '0.0.0.0', port: 8080 }`。
+2. **云服务器安全组 / 系统防火墙是否放行** —— 最常见原因。注意 Docker **会绕过 ufw 规则**，
+   所以 `ufw allow` 了也可能不通，**安全组必须单独放行**。
+3. **宿主机端口是否只绑到了 `127.0.0.1`** —— 检查 `.env` 的 `HERA_BIND`，或 `docker compose ps` 看端口映射。
+4. **看服务端日志** —— `docker compose logs -f hera-monitor`。服务端启动时会做自检并打印
+   实际监听地址、数据目录是否可写、静态资源是否就绪，还会明确列出发现的问题。
+
+**Q：Agent 上报失败？**
+确认 `--server` 用的是 Agent 能访问到的地址（不要写 `localhost`）。
 
 **Q：Agent 装完没反应？**
 在目标机执行 `hera-agent --print` 看 JSON 是否正常，再执行 `hera-agent --once` 看上报返回。若返回 `invalid agent key`，说明密钥不对或被重置过。
@@ -200,9 +262,11 @@ journalctl -u hera-agent -n 50
 
 **Q：数据存在哪？会不会一直涨？**
 `data/metrics/*.jsonl` 按服务器分文件追加，默认保留 7 天（面板可改），每 6 小时自动裁剪一次。
+Docker 部署下数据在 `hera-data` 命名卷里，`docker volume inspect hera-data` 可查实际路径。
 
 **Q：想用域名 + HTTPS？**
-用 Nginx/Caddy 反代到 `127.0.0.1:8080`，然后在面板「设置 → 面板公网地址」填写域名，一键安装命令会自动使用该地址。参考 `deploy/nginx.conf`。
+用 Nginx/Caddy 反代到 `127.0.0.1:8080`，把 `.env` 里的 `HERA_BIND` 改成 `127.0.0.1`（只允许本机访问），
+然后在面板「设置 → 面板公网地址」填写域名，一键安装命令会自动使用该地址。参考 `deploy/nginx.conf`。
 
 ---
 
