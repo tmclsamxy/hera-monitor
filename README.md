@@ -49,7 +49,7 @@
 | 🔔 **多渠道告警** | Webhook / Telegram / 钉钉 / 飞书 / Bark / Server 酱 / Gotify；支持阈值、持续时长、指定服务器、冷却时间 |
 | 🏷 **服务器管理** | 分组、标签、地区、备注、价格、到期日、自定义排序 |
 | 🔒 **安全** | 随机初始密码、HMAC 签名会话、登录限流、路径穿越防护、Agent 密钥可轮换、时序数据裁剪 |
-| 📦 **一键部署** | `install.sh --port 9000` 一步到位：自动选 Docker 或 systemd、支持自定义端口 / 监听地址 / 公网地址，带 `--dry-run` 演练 |
+| 📦 **一键部署** | 一条命令搞定：自动检测本机状态，未安装则引导选端口安装，已安装则提供升级 / 改配置 / 卸载选项；也支持全参数化非交互执行 |
 | 🔍 **可排障** | 启动时自检并打印实际监听地址 / 数据目录可写性 / 静态资源状态；异常请求必定返回响应而不会挂死；附带容器排障脚本 |
 | 🪶 **轻量** | 单进程常驻内存约 40MB；Agent 常驻内存 < 3MB |
 
@@ -57,7 +57,89 @@
 
 ## 🚀 快速开始
 
-### 一、部署服务端（Docker，推荐）
+### 一、部署服务端（推荐：一条命令，带交互引导）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tmclsamxy/hera-monitor/main/install.sh | sudo bash
+```
+
+脚本会先检测本机状态，再决定让你做什么：
+
+**本机未安装** → 引导你选参数，确认后自动部署：
+
+```
+  本机尚未安装 Hera Monitor，开始引导部署
+
+  开始安装前确认几个参数，直接回车即使用默认值：
+  面板端口 [8080]: 9000
+  是否只允许本机访问（前面挂 Nginx 反代时选 y） [y/N]: n
+  面板公网地址（走域名时填，否则留空）:
+
+  将使用：端口 9000，所有网卡可访问
+  确认开始部署 [Y/n]:
+```
+
+**本机已安装** → 列出当前配置，让你选要做什么：
+
+```
+──────────────────────────────────────────────────────────────
+  检测到本机已安装 Hera Monitor
+──────────────────────────────────────────────────────────────
+  安装目录    /opt/hera-monitor
+  部署方式    Docker
+  当前端口    9000
+  监听地址    0.0.0.0
+  运行状态    运行中
+──────────────────────────────────────────────────────────────
+
+  请选择要执行的操作：
+    1) 升级到最新版本         保留数据，沿用当前端口与域名配置
+    2) 修改端口 / 重新配置    保留数据，重新填写参数
+    3) 卸载                   程序文件删除，数据默认保留
+    4) 退出                   不做任何改动
+  请输入序号 [1]:
+```
+
+> 交互输入走终端设备（`/dev/tty`），所以 `curl | bash` 这种管道方式一样可以交互；
+> 如果环境里没有可用终端（例如自动化脚本），会自动降级为非交互并使用默认值或命令行参数。
+
+#### 非交互 / 指定参数
+
+```bash
+sudo bash install.sh --port 9000                     # 指定端口（两种部署模式都生效）
+sudo bash install.sh --port 9000 --host 127.0.0.1    # 只允许本机访问，前面挂反代
+sudo bash install.sh --port 9000 --public-url https://monitor.example.com
+sudo bash install.sh --upgrade                       # 直接升级，保留数据与现有配置
+sudo bash install.sh --reconfigure --port 9443       # 只改端口 / 配置
+sudo bash install.sh --uninstall                     # 卸载
+sudo bash install.sh --dry-run --port 9000           # 先看会做什么，零副作用
+sudo bash install.sh -y                              # 全程默认值，不询问
+```
+
+远程执行时把参数放在 `-s --` 之后：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tmclsamxy/hera-monitor/main/install.sh \
+  | sudo bash -s -- --port 9000
+```
+
+完整参数见 `sudo bash install.sh --help`：
+
+| 参数 | 说明 |
+|---|---|
+| `--port PORT` | 面板对外端口，默认 `8080`，**两种模式都生效** |
+| `--host HOST` | 监听地址。默认 `0.0.0.0`；填 `127.0.0.1` 则只允许本机访问 |
+| `--public-url URL` | 面板公网地址，填了之后一键接入命令会用它 |
+| `--mode auto\|docker\|native` | 部署方式，`auto` 会优先用 Docker |
+| `--image IMAGE` | 用预构建镜像，不本地构建 |
+| `--install` / `--upgrade` / `--reconfigure` / `--uninstall` | 强制指定要执行的动作 |
+| `-y, --yes` | 非交互，全部使用默认值（适合脚本 / CI） |
+| `--dir DIR` | 安装目录，默认 `/opt/hera-monitor` |
+| `--dry-run` | 只打印计划，不做改动 |
+
+### 二、部署服务端（Docker，手动）
+
+不想要交互引导的话，直接克隆仓库用 Compose：
 
 ```bash
 git clone https://github.com/tmclsamxy/hera-monitor.git
@@ -68,42 +150,7 @@ docker compose logs -f        # 首次启动会打印管理员初始密码
 
 浏览器打开 `http://服务器IP:8080` 即可登录。
 
-#### 自定义端口（推荐用部署脚本）
-
-不想手动改配置，就用带 `--port` 的安装脚本，它会自动检测 Docker 并写下 `.env`：
-
-```bash
-# 端口 9000
-sudo bash install.sh --port 9000
-
-# 端口 9000，且只允许本机访问（前面挂 Nginx 反代）
-sudo bash install.sh --port 9000 --host 127.0.0.1
-
-# 走域名，让面板生成的一键接入命令自动使用该域名
-sudo bash install.sh --port 9000 --public-url https://monitor.example.com
-
-# 先演练一遍，看清会做什么改动（不改动任何东西）
-sudo bash install.sh --dry-run --port 9000
-
-# 远程一行搞定
-curl -fsSL https://raw.githubusercontent.com/tmclsamxy/hera-monitor/main/install.sh \
-  | sudo bash -s -- --port 9000
-```
-
-完整参数见 `sudo bash install.sh --help`。常用项：
-
-| 参数 | 说明 |
-|---|---|
-| `--port PORT` | 面板对外端口，默认 `8080`，**两种模式都生效** |
-| `--host HOST` | 监听地址。默认 `0.0.0.0`；填 `127.0.0.1` 则只允许本机访问 |
-| `--public-url URL` | 面板公网地址，填了之后一键接入命令会用它 |
-| `--mode auto\|docker\|native` | 部署方式，`auto` 会优先用 Docker |
-| `--image IMAGE` | 用预构建镜像，不本地构建 |
-| `--dir DIR` | 安装目录，默认 `/opt/hera-monitor` |
-| `--dry-run` | 只打印计划，不做改动 |
-| `--uninstall` | 卸载（数据默认保留） |
-
-**手动改端口**的话：`cp .env.example .env`，编辑 `HERA_PORT` 后重新 `docker compose up -d` 即可
+**手动改端口**：`cp .env.example .env`，编辑 `HERA_PORT` 后重新 `docker compose up -d` 即可
 （Compose 会检测到端口映射变化并自动重建容器）。
 
 > 容器内部始终监听 8080，`--port` 改的是宿主机映射出来的端口，不影响容器内配置。
@@ -151,7 +198,7 @@ bash deploy/troubleshoot.sh --port 9000     # 自定义端口时加上
 > 反代时记得关闭 SSE 缓冲：`proxy_buffering off;`（示例配置已包含）。
 > 反代场景把 `HERA_BIND` 设为 `127.0.0.1`，只允许本机访问更安全。
 
-### 二、部署服务端（裸机 / systemd，不想用 Docker 时）
+### 三、部署服务端（裸机 / systemd，手动）
 
 在**一台**服务器上执行（Debian / Ubuntu / CentOS / RHEL / Alma / Rocky / Alpine / Arch 均可）：
 
@@ -171,7 +218,7 @@ cd hera-monitor && sudo bash install.sh --port 9000
 
 改端口随时可以重跑：`sudo bash /opt/hera-monitor/install.sh --port 9000`。
 
-### 三、接入被监控服务器
+### 四、接入被监控服务器
 
 登录面板 → 右上角 **「+ 接入新服务器」**，复制那一条命令，在目标服务器上以 root 执行：
 
@@ -226,11 +273,11 @@ hera-monitor/
 ├── test/
 │   ├── run.sh               # 一键跑全部测试（自起临时实例）
 │   ├── e2e.js               # 服务端端到端 65 项断言
-│   └── install-args.sh      # install.sh 参数与演练模式 26 项断言
+│   └── install-args.sh      # 参数 / 交互 / 生命周期 57 项断言
 ├── Dockerfile
 ├── docker-compose.yml       # 主推部署方式
 ├── .env.example             # 端口 / 绑定地址 / 公网地址
-└── install.sh               # 一键部署（自动选 Docker 或 systemd）
+└── install.sh               # 一键部署 / 升级 / 卸载（自动选 Docker 或 systemd）
 ```
 
 ---
@@ -312,7 +359,13 @@ journalctl -u hera-agent -n 50
 Docker 部署下数据在 `hera-data` 命名卷里，`docker volume inspect hera-data` 可查实际路径。
 
 **Q：怎么改端口？**
-推荐直接重跑安装脚本，两种模式都生效：`sudo bash /opt/hera-monitor/install.sh --port 9000`。
+推荐直接重跑安装脚本，它会检测到已安装并让你选择「修改端口 / 重新配置」，两种模式都生效：
+
+```bash
+sudo bash /opt/hera-monitor/install.sh            # 交互式，选 2
+sudo bash /opt/hera-monitor/install.sh --reconfigure --port 9000   # 直接指定
+```
+
 Docker 手动改则是编辑 `.env` 的 `HERA_PORT` 后 `docker compose up -d`（Compose 会自动重建容器）。
 改完记得在安全组同步放行新端口，并重新生成 Agent 安装命令（面板里的地址会跟着变）。
 
@@ -339,12 +392,12 @@ node server/src/index.js          # 默认 http://localhost:8080
 bash test/run.sh
 ```
 
-两个测试文件共 **91 项断言**：
+两个测试文件共 **122 项断言**：
 
 | 文件 | 断言数 | 覆盖范围 |
 |---|---|---|
 | `test/e2e.js` | 65 | 健康检查、静态资源、鉴权、登录限流、Agent 注册与上报、指标降采样、站点监控探测、告警触发与推送、密钥轮换、SSE 推送、异常与边界、**异常请求不得挂死** |
-| `test/install-args.sh` | 26 | `install.sh` 参数校验（端口范围、mode、绝对路径）、`--help` 完整性、`--dry-run` 演练输出、演练零副作用 |
+| `test/install-args.sh` | 57 | `install.sh` 参数校验（端口范围、mode、绝对路径）、`--help` 完整性、`--dry-run` 演练输出与零副作用、**交互式安装参数采集**、**端口校验重试**、**已安装检测与四项菜单**（升级保留配置 / 改配置生效 / 卸载不真删 / 退出）、无终端自动降级、`--yes` 行为 |
 
 单独跑参数测试（不需要 Node，秒级完成）：
 

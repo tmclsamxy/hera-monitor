@@ -33,14 +33,26 @@ NO_SERVICE=0
 UNINSTALL=0
 FORCE=0
 DRY_RUN=0
+ASSUME_YES=0        # -y / --yes：强制非交互
+ACTION="auto"       # auto | install | upgrade | reconfigure | uninstall | abort
+INTERACTIVE=0       # 有可用终端且未指定 --yes 时为 1
+PORT_FROM_CLI=0
+HOST_FROM_CLI=0
+URL_FROM_CLI=0
+INSTALLED=0
+INSTALL_KIND=""     # docker | native | unknown
+INSTALLED_RUNNING=0
+CURRENT_PORT=""
+CURRENT_BIND=""
+CURRENT_URL=""
 COMPOSE=""
 COMPOSE_SERVICE="hera-monitor"
 DEPLOY_KIND=""   # compose | run
 
 ORIG_ARGS=("$@")
 
-RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; CYAN='\033[36m'; PLAIN='\033[0m'
-[ -t 1 ] || { RED=''; GREEN=''; YELLOW=''; CYAN=''; PLAIN=''; }
+RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; CYAN='\033[36m'; BOLD='\033[1m'; PLAIN='\033[0m'
+[ -t 1 ] || { RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; PLAIN=''; }
 
 info() { printf '%s[hera]%s %s\n' "$CYAN" "$PLAIN" "$*"; }
 ok()   { printf '%s[ ok ]%s %s\n' "$GREEN" "$PLAIN" "$*"; }
@@ -50,7 +62,13 @@ step() { printf '\n%s==>%s %s\n' "$CYAN" "$PLAIN" "$*"; }
 
 usage() {
   cat <<'EOF'
-Hera Monitor 服务端一键部署
+Hera Monitor 服务端一键部署 / 升级 / 卸载
+
+直接执行（不带参数）时是交互式的：
+  · 本机未安装 → 引导你选择端口等参数后安装
+  · 本机已安装 → 列出当前配置，让你选升级 / 改端口 / 卸载 / 退出
+
+  交互输入走 /dev/tty，所以 curl | bash 这种方式一样可以交互。
 
 用法:
   install.sh [选项]
@@ -69,6 +87,13 @@ Hera Monitor 服务端一键部署
   --public-url URL  面板公网地址，填了之后生成的一键接入命令会用它
                     例如 https://monitor.example.com
 
+生命周期:
+  --install         强制走全新安装流程
+  --upgrade         直接升级到最新版本（保留数据与现有端口 / 域名配置）
+  --reconfigure     重新配置（改端口等，保留数据）
+  --uninstall       卸载（数据默认保留）
+  -y, --yes         非交互，全部使用默认值（适合脚本 / CI）
+
 其它:
   --dir DIR         安装目录，默认 /opt/hera-monitor
   --repo OWNER/REPO GitHub 仓库，默认 tmclsamxy/hera-monitor
@@ -76,28 +101,32 @@ Hera Monitor 服务端一键部署
   --no-service      native 模式：只部署不注册系统服务
   --force           覆盖已存在的程序文件（保留 data 数据目录）
   --dry-run         演练：只打印将要执行的操作，不做任何改动
-  --uninstall       卸载（数据目录默认保留）
   -h, --help        显示帮助
 
 示例:
-  sudo bash install.sh --port 9000
-  sudo bash install.sh --dry-run --port 9000
-  sudo bash install.sh --mode docker --port 9000 --host 127.0.0.1
-  curl -fsSL <仓库>/install.sh | sudo bash -s -- --port 9000
+  sudo bash install.sh                          # 交互式（推荐）
+  sudo bash install.sh --port 9000              # 直接指定端口
+  sudo bash install.sh --upgrade                # 升级到最新版本
+  sudo bash install.sh --dry-run --port 9000    # 先看会做什么
+  curl -fsSL <仓库>/install.sh | sudo bash      # 一键（会引导选端口）
 EOF
 }
 
 # ---------------------------------------------------------------- 参数解析
 while [ $# -gt 0 ]; do
   case "$1" in
-    --port)       PORT="${2:-}"; shift 2 ;;
-    --host)       HOST="${2:-}"; shift 2 ;;
+    --port)       PORT="${2:-}"; PORT_FROM_CLI=1; shift 2 ;;
+    --host)       HOST="${2:-}"; HOST_FROM_CLI=1; shift 2 ;;
     --mode)       MODE="${2:-}"; shift 2 ;;
     --image)      IMAGE="${2:-}"; shift 2 ;;
-    --public-url) PUBLIC_URL="${2:-}"; shift 2 ;;
+    --public-url) PUBLIC_URL="${2:-}"; URL_FROM_CLI=1; shift 2 ;;
     --dir)        INSTALL_DIR="${2:-}"; shift 2 ;;
     --repo)       REPO="${2:-}"; shift 2 ;;
     --branch)     BRANCH="${2:-}"; shift 2 ;;
+    --install)    ACTION="install"; shift ;;
+    --upgrade)    ACTION="upgrade"; shift ;;
+    --reconfigure) ACTION="reconfigure"; shift ;;
+    --yes|-y)     ASSUME_YES=1; shift ;;
     --no-service) NO_SERVICE=1; shift ;;
     --force)      FORCE=1; shift ;;
     --dry-run)    DRY_RUN=1; shift ;;
@@ -176,8 +205,200 @@ docker_health_ok() {
     >/dev/null 2>&1
 }
 
+# --------------------------------------------------------- 交互与状态探测
+#
+# 注意：curl | sudo bash 执行时脚本占用了 stdin，直接 read 会立刻拿到 EOF，
+# 所以输入统一从终端设备读。fd 3 用只读方式打开（不用读写混用的 <>），
+# 否则写提示会污染文件偏移、把还没读到的答案覆盖掉。
+# 提示一律走 stderr：既不会混进命令替换的输出，管道场景下也依然显示在终端。
+# 终端路径可用 HERA_TTY 覆盖，便于测试或指定其它终端。
+
+TTY_PATH="${HERA_TTY:-/dev/tty}"
+
+# 在子 shell 里试探能否打开；用子 shell 是因为 exec 重定向失败
+# 会让非交互 shell 直接退出，不能拿它做探测。
+tty_openable() { ( exec 3<"$TTY_PATH" ) 2>/dev/null; }
+
+# ask <提示> [默认值] -> 把答案写到 stdout
+ask() {
+  local prompt="$1" def="${2:-}" ans=""
+  if [ "$INTERACTIVE" != "1" ]; then
+    printf '%s' "$def"
+    return 0
+  fi
+  if [ -n "$def" ]; then
+    printf '%s [%s]: ' "$prompt" "$def" >&2
+  else
+    printf '%s: ' "$prompt" >&2
+  fi
+  read -r ans <&3 || ans=""
+  ans="${ans#"${ans%%[![:space:]]*}"}"
+  ans="${ans%"${ans##*[![:space:]]}"}"
+  printf '%s' "${ans:-$def}"
+}
+
+# ask_yn <提示> <y|n 为默认> -> 返回 0=是 1=否
+ask_yn() {
+  local prompt="$1" def="${2:-n}" hint ans
+  [ "$def" = "y" ] && hint="Y/n" || hint="y/N"
+  if [ "$INTERACTIVE" != "1" ]; then
+    [ "$def" = "y" ]
+    return $?
+  fi
+  printf '%s [%s]: ' "$prompt" "$hint" >&2
+  read -r ans <&3 || ans=""
+  ans="$(printf '%s' "$ans" | tr 'A-Z' 'a-z')"
+  [ -z "$ans" ] && ans="$def"
+  case "$ans" in y|yes) return 0 ;; *) return 1 ;; esac
+}
+
+# 循环追问直到拿到合法端口；非交互时直接返回默认值
+ask_port() {
+  local prompt="$1" def="$2" p
+  while :; do
+    p="$(ask "$prompt" "$def")"
+    if [ -z "$p" ]; then printf '%s' "$def"; return 0; fi
+    case "$p" in
+      *[!0-9]*)
+        printf '  端口必须是数字，请重新输入\n' >&2 ;;
+      *)
+        if [ "$p" -ge 1 ] && [ "$p" -le 65535 ]; then
+          printf '%s' "$p"; return 0
+        fi
+        printf '  端口必须在 1-65535 之间\n' >&2 ;;
+    esac
+  done
+}
+
+# 探测本机是否已安装，并顺带把现有配置读出来（升级时不冲掉用户改过的值）
+detect_install() {
+  INSTALLED=0; INSTALL_KIND=""; INSTALLED_RUNNING=0
+  CURRENT_PORT=""; CURRENT_BIND=""; CURRENT_URL=""
+
+  # 1) Docker 容器
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 \
+     && docker inspect "$COMPOSE_SERVICE" >/dev/null 2>&1; then
+    INSTALLED=1
+    INSTALL_KIND="docker"
+    [ "$(docker inspect -f '{{.State.Running}}' "$COMPOSE_SERVICE" 2>/dev/null)" = "true" ] \
+      && INSTALLED_RUNNING=1
+    CURRENT_PORT="$(docker inspect -f \
+      '{{range $p, $conf := .NetworkSettings.Ports}}{{range $conf}}{{.HostPort}} {{end}}{{end}}' \
+      "$COMPOSE_SERVICE" 2>/dev/null | awk '{print $1; exit}')"
+  fi
+
+  # 2) 部署目录里的 .env（Docker 模式的配置来源）
+  if [ -f "${INSTALL_DIR}/.env" ]; then
+    [ -z "$CURRENT_PORT" ] && CURRENT_PORT="$(sed -n 's/^HERA_PORT=\([0-9]\{1,5\}\).*/\1/p' "${INSTALL_DIR}/.env" | head -n1)"
+    CURRENT_BIND="$(sed -n 's/^HERA_BIND=\(.*\)$/\1/p' "${INSTALL_DIR}/.env" | head -n1)"
+    CURRENT_URL="$(sed -n 's/^HERA_PUBLIC_URL=\(.*\)$/\1/p' "${INSTALL_DIR}/.env" | head -n1)"
+  fi
+
+  # 3) 裸机的 systemd 单元
+  local unit="/etc/systemd/system/${SERVICE_NAME}.service"
+  if [ -f "$unit" ]; then
+    INSTALLED=1
+    [ -z "$INSTALL_KIND" ] && INSTALL_KIND="native"
+    [ -z "$CURRENT_PORT" ] && CURRENT_PORT="$(sed -n 's/^Environment=HERA_PORT=\([0-9]\{1,5\}\).*/\1/p' "$unit" | head -n1)"
+    [ -z "$CURRENT_BIND" ] && CURRENT_BIND="$(sed -n 's/^Environment=HERA_HOST=\(.*\)$/\1/p' "$unit" | head -n1)"
+    [ -z "$CURRENT_URL" ] && CURRENT_URL="$(sed -n 's/^Environment=HERA_PUBLIC_URL=\(.*\)$/\1/p' "$unit" | head -n1)"
+    systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && INSTALLED_RUNNING=1
+  elif [ "$INSTALLED" = "0" ] && [ -f "${INSTALL_DIR}/server/src/index.js" ]; then
+    # 目录里有程序文件，但没有容器也没有 systemd 单元（比如被手动停掉了）
+    INSTALLED=1
+  fi
+
+  # 部署形态兜底：有 .env / docker-compose.yml 按 Docker 算，否则按裸机算
+  if [ "$INSTALLED" = "1" ] && [ -z "$INSTALL_KIND" ]; then
+    if [ -f "${INSTALL_DIR}/docker-compose.yml" ] || [ -f "${INSTALL_DIR}/.env" ]; then
+      INSTALL_KIND="docker"
+    elif [ -f "${INSTALL_DIR}/server/src/index.js" ]; then
+      INSTALL_KIND="native"
+    else
+      INSTALL_KIND="unknown"
+    fi
+  fi
+
+  [ "$INSTALLED" = "1" ] && [ -z "$CURRENT_PORT" ] && CURRENT_PORT="8080"
+
+  # 升级 / 重新配置时沿用现有配置，避免把用户改过的端口和域名冲掉
+  if [ "$INSTALLED" = "1" ]; then
+    [ "$PORT_FROM_CLI" = "0" ] && [ -n "$CURRENT_PORT" ] && PORT="$CURRENT_PORT"
+    [ "$HOST_FROM_CLI" = "0" ] && [ -n "$CURRENT_BIND" ] && HOST="$CURRENT_BIND"
+    [ "$URL_FROM_CLI" = "0" ] && [ -n "$CURRENT_URL" ] && PUBLIC_URL="$CURRENT_URL"
+  fi
+}
+
+print_installed_info() {
+  local line
+  line="$(printf '─%.0s' {1..62})"
+  printf '\n%s%s%s\n' "$CYAN" "$line" "$PLAIN"
+  printf '  %s检测到本机已安装 Hera Monitor%s\n' "$BOLD" "$PLAIN"
+  printf '%s%s%s\n' "$CYAN" "$line" "$PLAIN"
+  printf '  安装目录    %s%s\n' "$INSTALL_DIR" "$([ -d "$INSTALL_DIR" ] || echo '（不存在）')"
+  printf '  部署方式    %s\n' "$([ "$INSTALL_KIND" = "docker" ] && echo 'Docker' || echo '裸机 systemd')"
+  printf '  当前端口    %s\n' "${CURRENT_PORT:-未知}"
+  printf '  监听地址    %s\n' "${CURRENT_BIND:-0.0.0.0}"
+  [ -n "$CURRENT_URL" ] && printf '  公网地址    %s\n' "$CURRENT_URL"
+  printf '  运行状态    %s%s%s\n' \
+    "$([ "$INSTALLED_RUNNING" = "1" ] && printf '%s' "$GREEN" || printf '%s' "$YELLOW")" \
+    "$([ "$INSTALLED_RUNNING" = "1" ] && echo '运行中' || echo '已停止')" "$PLAIN"
+  printf '%s%s%s\n' "$CYAN" "$line" "$PLAIN"
+}
+
+choose_action() {
+  local c
+  printf '\n  请选择要执行的操作：\n' >&2
+  printf '    1) 升级到最新版本         保留数据，沿用当前端口与域名配置\n' >&2
+  printf '    2) 修改端口 / 重新配置    保留数据，重新填写参数\n' >&2
+  printf '    3) 卸载                   程序文件删除，数据默认保留\n' >&2
+  printf '    4) 退出                   不做任何改动\n' >&2
+  while :; do
+    printf '\n  请输入序号 [1]: ' >&2
+    read -r c <&3 || c=""
+    [ -z "$c" ] && c=1
+    case "$c" in
+      1) ACTION="upgrade"; return 0 ;;
+      2) ACTION="reconfigure"; return 0 ;;
+      3) ACTION="uninstall"; return 0 ;;
+      4|q|Q) ACTION="abort"; return 0 ;;
+      *) printf '  %s请输入 1-4%s\n' "$RED" "$PLAIN" >&2 ;;
+    esac
+  done
+}
+
+# 全新安装前询问参数（只有交互模式会真的问）
+ask_fresh_params() {
+  printf '\n  开始安装前确认几个参数，直接回车即使用默认值：\n' >&2
+
+  PORT="$(ask_port '  面板端口' "$PORT")"
+
+  if [ "$HOST_FROM_CLI" = "0" ]; then
+    if ask_yn '  是否只允许本机访问（前面挂 Nginx 反代时选 y）' n; then
+      HOST="127.0.0.1"
+    else
+      HOST="0.0.0.0"
+    fi
+  fi
+
+  if [ "$URL_FROM_CLI" = "0" ]; then
+    local u
+    u="$(ask '  面板公网地址（走域名时填，否则留空）' '')"
+    [ -n "$u" ] && PUBLIC_URL="${u%/}"
+  fi
+
+  printf '\n  将使用：端口 %s%s%s\n' "$PORT" \
+    "$([ "$HOST" = "127.0.0.1" ] && echo '，仅本机可访问' || echo '，所有网卡可访问')" \
+    "${PUBLIC_URL:+，公网地址 $PUBLIC_URL}" >&2
+
+  if ! ask_yn '  确认开始部署' y; then
+    info "已取消，未做任何改动"
+    exit 0
+  fi
+}
+
 # ------------------------------------------------------------------ 卸载
-if [ "$UNINSTALL" = "1" ]; then
+do_uninstall() {
   info "开始卸载 Hera Monitor…"
 
   # Docker 模式：先停容器（compose 与 docker run 两种方式都覆盖）
@@ -207,7 +428,16 @@ if [ "$UNINSTALL" = "1" ]; then
   printf '    裸机模式   rm -rf %s/data\n' "$INSTALL_DIR"
   printf '    Compose    docker volume rm %s_hera-data\n' "$(basename "$INSTALL_DIR")"
   printf '    docker run docker volume rm hera-data\n'
-  exit 0
+}
+
+if [ "$UNINSTALL" = "1" ]; then
+  # 带 --dry-run 时只登记动作，交给下面的演练分支去打印计划
+  if [ "$DRY_RUN" = "1" ]; then
+    ACTION="uninstall"
+  else
+    do_uninstall
+    exit 0
+  fi
 fi
 
 # ------------------------------------------------------------ 获取程序文件
@@ -543,6 +773,8 @@ print_summary() {
 }
 
 # ---------------------------------------------------------------- 主流程
+
+# 1) 解析部署方式
 if [ "$MODE" = "auto" ]; then
   if docker_usable; then
     MODE="docker"
@@ -557,11 +789,94 @@ if [ "$MODE" = "auto" ]; then
   fi
 fi
 
+# 2) 判断能否交互。交互读写终端设备，因此 curl | bash 也能正常交互
+if [ "$ASSUME_YES" = "1" ]; then
+  INTERACTIVE=0
+elif tty_openable; then
+  # 注意：这里不能写 exec 3<"$TTY" 2>/dev/null ——
+  # exec 会把该重定向永久应用到当前 shell，等于把整个脚本的 stderr 丢掉，
+  # 所有提示都会静默消失。tty_openable 已经确认过可打开，直接开即可。
+  exec 3<"$TTY_PATH"
+  INTERACTIVE=1
+else
+  INTERACTIVE=0
+fi
+
+# 3) 探测既有安装，并把现有端口 / 绑定地址 / 公网地址带进默认值
+detect_install
+
+# 4) 决定本次要做什么
+#
+# 这里用递归而不是单层 case：菜单里选完「重新配置」后 ACTION 会变，
+# 而单层 case 已经匹配过 auto 分支、不会再回到新分支，导致选择被静默忽略。
+resolve_action() {
+  case "$ACTION" in
+    auto)
+      if [ "$INSTALLED" = "1" ]; then
+        print_installed_info
+        if [ "$INTERACTIVE" = "1" ]; then
+          choose_action
+          resolve_action        # 按用户选的动作重新解析一次
+          return
+        fi
+        ACTION="upgrade"
+        info "非交互模式：检测到已安装，默认执行升级"
+      else
+        ACTION="install"
+        if [ "$INTERACTIVE" = "1" ]; then
+          printf '\n  %s本机尚未安装 Hera Monitor，开始引导部署%s\n' "$BOLD" "$PLAIN"
+          ask_fresh_params
+        else
+          info "本机尚未安装，使用默认参数安装（端口 ${PORT}）"
+        fi
+      fi
+      ;;
+    upgrade)
+      [ "$INSTALLED" = "1" ] || die "本机未检测到 Hera Monitor，无法升级。去掉 --upgrade 即可全新安装"
+      print_installed_info
+      info "将升级到最新版本，沿用当前端口 ${PORT}"
+      ;;
+    reconfigure)
+      [ "$INSTALLED" = "1" ] || die "本机未检测到 Hera Monitor，无法重新配置。去掉 --reconfigure 即可全新安装"
+      print_installed_info
+      if [ "$INTERACTIVE" = "1" ]; then
+        ask_fresh_params
+      else
+        info "非交互模式：按命令行参数重新配置，端口 ${PORT}"
+      fi
+      ACTION="upgrade"   # 重新配置 = 带着新参数重新部署一次，数据不动
+      ;;
+    install)
+      if [ "$INTERACTIVE" = "1" ]; then
+        printf '\n  %s全新安装 Hera Monitor%s\n' "$BOLD" "$PLAIN"
+        ask_fresh_params
+      fi
+      ;;
+  esac
+}
+
+resolve_action
+
+if [ "$ACTION" = "abort" ]; then
+  info "已取消，未做任何改动"
+  exit 0
+fi
+
 # ---------------------------------------------------------------- 演练模式
+# 放在卸载之前：--dry-run 绝不允许真的删东西
 if [ "$DRY_RUN" = "1" ]; then
   printf '\n%s[演练模式] 以下操作不会真正执行%s\n' "$YELLOW" "$PLAIN"
   printf '%s\n' "$(printf '─%.0s' {1..62})"
-  printf '  部署方式    %s%s\n' "$MODE" "$([ "$MODE" = "auto" ] && echo '（未解析）' || echo '')"
+  if [ "$ACTION" = "uninstall" ]; then
+    printf '  本次动作    uninstall（卸载）\n'
+    printf '  将停止移除  %s 容器 / systemd 服务\n' "$COMPOSE_SERVICE"
+    printf '  将删除      %s 下的程序文件（server / agent / deploy / Dockerfile / .env）\n' "$INSTALL_DIR"
+    printf '  数据保留    %s/data 或 hera-data 卷\n' "$INSTALL_DIR"
+    printf '%s\n\n' "$(printf '─%.0s' {1..62})"
+    exit 0
+  fi
+  printf '  本次动作    %s%s\n' "$ACTION" "$([ "$INSTALLED" = "1" ] && echo '（检测到已有安装）' || echo '（全新安装）')"
+  printf '  部署方式    %s\n' "$MODE"
   printf '  安装目录    %s\n' "$INSTALL_DIR"
   printf '  面板端口    %s\n' "$PORT"
   printf '  监听地址    %s\n' "$HOST"
@@ -591,10 +906,6 @@ if [ "$DRY_RUN" = "1" ]; then
 
   printf '\n  访问地址    http://<服务器IP>:%s\n' "$PORT"
   printf '%s\n\n' "$(printf '─%.0s' {1..62})"
-  if [ "$MODE" = "auto" ]; then
-    warn "auto 模式需要在目标机器上探测 Docker，演练模式下无法确定最终方式"
-    warn "用 --mode docker 或 --mode native 明确指定即可看到完整计划"
-  fi
   exit 0
 fi
 
