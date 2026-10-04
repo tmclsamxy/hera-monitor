@@ -84,6 +84,8 @@
     group: '',
     sort: 'name',
     filter: 'all',
+    // 概览页的查看方式：card（卡片）/ list（列表），记住用户选择
+    view: localStorage.getItem('hera_view') === 'list' ? 'list' : 'card',
   };
 
   /* ---------------------------------------------------------- API */
@@ -550,9 +552,16 @@
     if (S.sort === 'cpu') list.sort((a, b) => (b.sample?.cpu || 0) - (a.sample?.cpu || 0));
     if (S.sort === 'mem') list.sort((a, b) => (b.sample?.mem || 0) - (a.sample?.mem || 0));
     if (S.sort === 'disk') list.sort((a, b) => (b.sample?.diskPct || 0) - (a.sample?.diskPct || 0));
+    if (S.sort === 'load') list.sort((a, b) => (b.sample?.load || 0) - (a.sample?.load || 0));
+    if (S.sort === 'uptime') list.sort((a, b) => (b.sample?.uptime || 0) - (a.sample?.uptime || 0));
     if (S.sort === 'offline') list.sort((a, b) => Number(a.online) - Number(b.online));
     return list;
   }
+
+  const SORT_OPTIONS = [
+    ['name', '按名称'], ['cpu', '按 CPU'], ['mem', '按内存'],
+    ['disk', '按硬盘'], ['load', '按负载'], ['uptime', '按在线时长'], ['offline', '离线优先'],
+  ];
 
   function metricBar(key, label, pct, extra = '') {
     const v = Number(pct) || 0;
@@ -622,8 +631,134 @@
       </div>`;
   }
 
-  function overviewSkeleton() {
-    return `<div class="server-grid">${Array.from({ length: 6 }).map(() => `
+  /* ---- 列表视图：一屏能扫更多机器，表头可点击排序 ---- */
+
+  const LIST_COLUMNS = [
+    { key: 'name', label: '服务器', sort: 'name', dir: '↑' },
+    { key: 'group', label: '分组 / 标签' },
+    { key: 'os', label: '系统' },
+    { key: 'cpu', label: 'CPU', sort: 'cpu', dir: '↓' },
+    { key: 'mem', label: '内存', sort: 'mem', dir: '↓' },
+    { key: 'disk', label: '硬盘', sort: 'disk', dir: '↓' },
+    { key: 'load', label: '负载', sort: 'load', dir: '↓' },
+    { key: 'net', label: '网络' },
+    { key: 'uptime', label: '运行时长', sort: 'uptime', dir: '↓' },
+    { key: 'actions', label: '' },
+  ];
+
+  /** 表格里的「数值 + 迷你进度条」单元格 */
+  function tdMetric(pct, extra = '') {
+    const v = Number(pct) || 0;
+    return `<td class="td-metric"${extra ? ` title="${esc(extra)}"` : ''}>
+      <div class="td-val">${esc(pctText(v))}</div>
+      <div class="bar mini"><i class="${usageClass(v)}" style="width:${Math.min(100, v).toFixed(1)}%"></i></div>
+    </td>`;
+  }
+
+  function rowActions(s) {
+    return `<div class="row-actions">
+      <button class="icon-btn" data-edit="${esc(s.id)}" title="编辑">
+        <svg viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4z"/></svg>
+      </button>
+      <a class="icon-btn" href="#/detail/${esc(s.id)}" title="查看详情">
+        <svg viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></svg>
+      </a>
+    </div>`;
+  }
+
+  function serverRow(s) {
+    const sm = s.sample;
+    const host = s.host || {};
+    const online = !!s.online;
+
+    const tags = [
+      s.group && s.group !== '默认' ? `<span class="tag">${esc(s.group)}</span>` : '',
+      s.region ? `<span class="tag accent">${esc(s.region)}</span>` : '',
+      ...(s.tags || []).map((t) => `<span class="tag">${esc(t)}</span>`),
+    ].filter(Boolean).join(' ');
+
+    const nameCell = `<td class="td-name">
+      <div class="tr-name">
+        <span class="status-dot ${online ? 'on' : 'off'}"></span>
+        <span class="nm">${esc(s.name)}</span>
+      </div>
+      <div class="tr-sub">${esc(s.ip || '—')}</div>
+    </td>`;
+
+    // 从未上报过的机器只占一行提示，不留一堆空列
+    if (!sm) {
+      return `<tr class="row-offline" data-id="${esc(s.id)}">
+        ${nameCell}
+        <td>${tags || '<span class="muted">—</span>'}</td>
+        <td colspan="6" class="muted">尚未收到该服务器的上报数据</td>
+        <td class="muted">—</td>
+        <td>${rowActions(s)}</td>
+      </tr>`;
+    }
+
+    const loadPct = host.cpuCores ? (sm.load / host.cpuCores) * 100 : Math.min(100, sm.load * 25);
+    return `<tr class="${online ? '' : 'row-offline'}" data-id="${esc(s.id)}">
+      ${nameCell}
+      <td>${tags || '<span class="muted">默认</span>'}</td>
+      <td>
+        <div class="tr-os">${esc(host.os || '—')}</div>
+        <div class="tr-sub">${esc([host.arch, host.cpuCores ? `${host.cpuCores} 核` : ''].filter(Boolean).join(' · ') || '—')}</div>
+      </td>
+      ${tdMetric(sm.cpu, `已用 ${pctText(sm.cpu)}`)}
+      ${tdMetric(sm.mem, s.memTotal ? `${fmtBytes(sm.memUsed || 0)} / ${fmtBytes(s.memTotal)}` : '')}
+      ${tdMetric(sm.diskPct, s.diskTotal ? `${fmtBytes((sm.diskPct / 100) * s.diskTotal)} / ${fmtBytes(s.diskTotal)}` : '')}
+      ${tdMetric(loadPct, `1 分钟负载 ${sm.load.toFixed(2)}${host.cpuCores ? ` / ${host.cpuCores} 核` : ''}`)}
+      <td class="td-net">
+        <div><span class="arw down">↓</span> ${esc(fmtSpeed(sm.rxs))}</div>
+        <div><span class="arw up">↑</span> ${esc(fmtSpeed(sm.txs))}</div>
+      </td>
+      <td class="nowrap">${online
+    ? esc(fmtDuration(sm.uptime))
+    : `<span class="muted">失联 ${esc(timeAgo(s.lastSeen))}</span>`}</td>
+      <td>${rowActions(s)}</td>
+    </tr>`;
+  }
+
+  function serverTable(list) {
+    const head = LIST_COLUMNS.map((c) => {
+      if (!c.sort) return `<th>${esc(c.label)}</th>`;
+      const on = S.sort === c.sort;
+      // 名称是升序，指标是「大的排前面」，箭头方向要跟着变，否则会误导
+      const mark = on ? `<span class="sort-mark">${c.dir || '↓'}</span>` : '';
+      return `<th class="sortable${on ? ' sorted' : ''}" data-sort="${esc(c.sort)}"
+        title="点击按${esc(c.label)}排序">${esc(c.label)}${mark}</th>`;
+    }).join('');
+    return `<div class="server-table-wrap"><table class="server-table">
+      <thead><tr>${head}</tr></thead>
+      <tbody>${list.map(serverRow).join('')}</tbody>
+    </table></div>`;
+  }
+
+  /** 按当前视图重绘服务器区域（概览页与 SSE 刷新共用） */
+  function drawServers() {
+    const box = document.getElementById('serverBox');
+    if (!box) return;
+    const list = filteredServers();
+    if (!list.length) {
+      box.className = '';
+      box.innerHTML = '<div class="empty"><h3>没有匹配的服务器</h3><p>换个搜索条件试试</p></div>';
+      return;
+    }
+    if (S.view === 'list') {
+      box.className = '';
+      box.innerHTML = serverTable(list);
+    } else {
+      box.className = 'server-grid';
+      box.innerHTML = list.map(serverCard).join('');
+    }
+  }
+
+  function setView(v) {
+    S.view = v === 'list' ? 'list' : 'card';
+    localStorage.setItem('hera_view', S.view);
+  }
+
+  function overviewSkeleton() {    return `<div class="server-grid">${Array.from({ length: 6 }).map(() => `
       <div class="server-card skeleton">
         <div class="skeleton-block" style="height:15px;width:45%;margin-bottom:10px"></div>
         <div class="skeleton-block" style="height:11px;width:65%;margin-bottom:16px"></div>
@@ -660,9 +795,17 @@
           ${[['all', '全部状态'], ['online', '仅在线'], ['offline', '仅离线']].map(([v, l]) => `<option value="${v}" ${S.filter === v ? 'selected' : ''}>${l}</option>`).join('')}
         </select>
         <select id="ovSort">
-          ${[['name', '按名称'], ['cpu', '按 CPU'], ['mem', '按内存'], ['disk', '按硬盘'], ['offline', '离线优先']].map(([v, l]) => `<option value="${v}" ${S.sort === v ? 'selected' : ''}>${l}</option>`).join('')}
+          ${SORT_OPTIONS.map(([v, l]) => `<option value="${v}" ${S.sort === v ? 'selected' : ''}>${l}</option>`).join('')}
         </select>
         <span class="grow"></span>
+        <div class="view-switch" id="ovView" role="group" aria-label="切换查看方式">
+          <button data-view="card" class="${S.view === 'card' ? 'active' : ''}" title="卡片视图" aria-pressed="${S.view === 'card'}">
+            <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+          </button>
+          <button data-view="list" class="${S.view === 'list' ? 'active' : ''}" title="列表视图" aria-pressed="${S.view === 'list'}">
+            <svg viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+          </button>
+        </div>
         <button class="btn btn-primary btn-sm" id="addServerBtn">+ 接入新服务器</button>
       </div>
 
@@ -675,25 +818,30 @@
               <button class="btn btn-sm copy-btn" data-copy="${esc(S.boot?.install?.command || '')}">复制</button>
             </div>
           </div>
-        </div>` : '<div id="serverGrid" class="server-grid"></div>'}
+        </div>` : '<div id="serverBox"></div>'}
     `;
 
-    const draw = () => {
-      const grid = $('#serverGrid', view);
-      if (!grid) return;
-      const list = filteredServers();
-      grid.innerHTML = list.length
-        ? list.map(serverCard).join('')
-        : '<div class="empty" style="grid-column:1/-1"><h3>没有匹配的服务器</h3><p>换个搜索条件试试</p></div>';
-    };
-    draw();
+    drawServers();
 
     const search = $('#ovSearch', view);
-    search.addEventListener('input', () => { S.search = search.value; draw(); });
-    $('#ovGroup', view).addEventListener('change', (e) => { S.group = e.target.value; draw(); });
-    $('#ovFilter', view).addEventListener('change', (e) => { S.filter = e.target.value; draw(); });
-    $('#ovSort', view).addEventListener('change', (e) => { S.sort = e.target.value; draw(); });
+    search.addEventListener('input', () => { S.search = search.value; drawServers(); });
+    $('#ovGroup', view).addEventListener('change', (e) => { S.group = e.target.value; drawServers(); });
+    $('#ovFilter', view).addEventListener('change', (e) => { S.filter = e.target.value; drawServers(); });
+    $('#ovSort', view).addEventListener('change', (e) => { S.sort = e.target.value; drawServers(); });
     $('#addServerBtn', view).addEventListener('click', showInstallModal);
+
+    // 视图切换
+    $('#ovView', view).addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-view]');
+      if (!btn) return;
+      setView(btn.dataset.view);
+      $$('#ovView button', view).forEach((b) => {
+        const on = b.dataset.view === S.view;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-pressed', String(on));
+      });
+      drawServers();
+    });
 
     view.addEventListener('click', (e) => {
       const editBtn = e.target.closest('[data-edit]');
@@ -702,8 +850,17 @@
         editServer(editBtn.dataset.edit);
         return;
       }
-      const card = e.target.closest('.server-card');
-      if (card && card.dataset.id) location.hash = `#/detail/${card.dataset.id}`;
+      // 列表视图：点表头排序
+      const th = e.target.closest('th[data-sort]');
+      if (th) {
+        S.sort = th.dataset.sort;
+        const sel = $('#ovSort', view);
+        if (sel) sel.value = S.sort;
+        drawServers();
+        return;
+      }
+      const row = e.target.closest('.server-card, tr[data-id]');
+      if (row && row.dataset.id) location.hash = `#/detail/${row.dataset.id}`;
     });
 
     bindCopy(view);
@@ -1475,15 +1632,12 @@
 
   function onOverview() {
     if (S.route === 'overview' && S.overview) {
-      // 保留筛选条件，只重绘列表
+      // 保留筛选条件，只重绘列表（正面输入搜索时不要打断光标）
       const view = $('#view');
-      const grid = $('#serverGrid', view);
+      const box = document.getElementById('serverBox');
       const st = S.overview.stats;
-      if (grid && document.activeElement !== $('#ovSearch', view)) {
-        const list = filteredServers();
-        grid.innerHTML = list.length
-          ? list.map(serverCard).join('')
-          : '<div class="empty" style="grid-column:1/-1"><h3>没有匹配的服务器</h3><p>换个搜索条件试试</p></div>';
+      if (box && document.activeElement !== $('#ovSearch', view)) {
+        drawServers();
         const row = $('.stat-row', view);
         if (row) {
           const vals = row.querySelectorAll('.v');
@@ -1531,7 +1685,7 @@
   async function boot() {
     showApp();
     await refreshBoot();
-    if (!location.search.includes('nosse')) initSSE();
+    initSSE();
     if (refreshTimer) clearInterval(refreshTimer);
     refreshTimer = setInterval(() => {
       if (document.hidden) return;

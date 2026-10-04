@@ -65,8 +65,12 @@ function report(hostname, id, cpu, memUsedPct, rx, tx) {
   ok('GET / 返回面板 HTML', r.status === 200 && r.text.includes('Hera Monitor'));
   r = await api('/app.js', { raw: true });
   ok('GET /app.js', r.status === 200 && r.text.length > 1000);
+  // 概览页双视图：确保前端资源里确实带上了这块实现
+  ok('/app.js 含视图切换实现', r.text.includes('view-switch') && r.text.includes('serverTable') && r.text.includes('setView'));
+  ok('/app.js 记住视图选择', r.text.includes("localStorage.setItem('hera_view'"));
   r = await api('/style.css', { raw: true });
   ok('GET /style.css', r.status === 200 && r.text.includes('--accent'));
+  ok('/style.css 含列表视图样式', r.text.includes('.server-table') && r.text.includes('.view-switch'));
   r = await api('/install-agent.sh', { raw: true });
   ok('GET /install-agent.sh', r.status === 200 && r.text.startsWith('#!/usr/bin/env bash'));
   r = await api('/agent/hera-agent.sh', { raw: true });
