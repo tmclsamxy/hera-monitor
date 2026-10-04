@@ -30,8 +30,14 @@ INSECURE=0
 UNINSTALL=0
 NO_START=0
 
-RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; CYAN='\033[36m'; PLAIN='\033[0m'
-[ -t 1 ] || { RED=''; GREEN=''; YELLOW=''; CYAN=''; PLAIN=''; }
+# ⚠️ 必须用 $'...'（ANSI-C 引用）：单引号里的 \033 是字面量，会被原样打印出来
+RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; CYAN=$'\033[36m'; PLAIN=$'\033[0m'
+
+# 颜色开关：非终端默认关闭；NO_COLOR 强制关闭；FORCE_COLOR 强制开启（便于测试）
+if [ -n "${NO_COLOR:-}" ] \
+   || { [ -z "${FORCE_COLOR:-}" ] && [ ! -t 1 ]; }; then
+  RED=''; GREEN=''; YELLOW=''; CYAN=''; PLAIN=''
+fi
 
 info()  { printf '%s[hera]%s %s\n' "$CYAN" "$PLAIN" "$*"; }
 ok()    { printf '%s[ ok ]%s %s\n' "$GREEN" "$PLAIN" "$*"; }

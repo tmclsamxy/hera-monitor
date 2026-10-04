@@ -51,8 +51,17 @@ DEPLOY_KIND=""   # compose | run
 
 ORIG_ARGS=("$@")
 
-RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; CYAN='\033[36m'; BOLD='\033[1m'; PLAIN='\033[0m'
-[ -t 1 ] || { RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; PLAIN=''; }
+# ⚠️ 必须用 $'...'（ANSI-C 引用）来写颜色码。
+# 单引号里的 \033 是「字面量」，bash 不会转义，
+# 于是 printf '%s' "$RED" 会把 \033[31m 原样打进终端 —— 用户看到一堆乱码。
+RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
+CYAN=$'\033[36m'; BOLD=$'\033[1m'; PLAIN=$'\033[0m'
+
+# 颜色开关：非终端默认关闭；NO_COLOR 强制关闭；FORCE_COLOR 强制开启（便于测试）
+if [ -n "${NO_COLOR:-}" ] \
+   || { [ -z "${FORCE_COLOR:-}" ] && [ ! -t 1 ]; }; then
+  RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; PLAIN=''
+fi
 
 info() { printf '%s[hera]%s %s\n' "$CYAN" "$PLAIN" "$*"; }
 ok()   { printf '%s[ ok ]%s %s\n' "$GREEN" "$PLAIN" "$*"; }

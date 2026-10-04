@@ -259,6 +259,48 @@ else
   bad '演练模式零副作用（不创建目录）'
 fi
 
+# ========================================================== 7. 颜色码正确性
+#
+# 历史 bug：颜色变量写成 RED='\033[31m'。单引号不做转义，
+# 于是终端里直接显示 \033[36m 这种乱码。必须用 $'...'（ANSI-C 引用）。
+printf '\n[颜色码]\n'
+ESC=$'\033'
+LITERAL='=\\033'
+
+# 静态检查：所有 shell 脚本里都不该再出现 RED='\033...' 这种写法
+STATIC_HITS="$(grep -rn -- "$LITERAL" --include='*.sh' . 2>/dev/null | grep -v '^./test/' | wc -l | tr -d ' ')"
+if [ "$STATIC_HITS" = "0" ]; then
+  ok "所有脚本的颜色变量都用 \$'...' 定义，无字面量 \033"
+else
+  bad "仍有脚本用字面量 \033 定义颜色" "$(grep -rn -- "$LITERAL" --include='*.sh' . | grep -v '^./test/' | head -2 | cut -c1-70)"
+fi
+
+# 运行时：FORCE_COLOR 下必须输出真实 ESC，且不含字面量
+OUT="$(FORCE_COLOR=1 bash install.sh --dry-run --dir "$FRESH" 2>&1)"
+HAS_ESC=0; printf '%s' "$OUT" | grep -qF "$ESC" && HAS_ESC=1
+HAS_LIT=0; printf '%s' "$OUT" | grep -q -- "$LITERAL" && HAS_LIT=1
+if [ "$HAS_ESC" = "1" ] && [ "$HAS_LIT" = "0" ]; then
+  ok 'FORCE_COLOR=1 输出真实 ESC 字符而非字面量'
+else
+  bad 'FORCE_COLOR=1 输出真实 ESC 字符而非字面量' "ESC=$HAS_ESC 字面量=$HAS_LIT"
+fi
+
+# 非终端（管道）默认不输出颜色
+OUT="$(bash install.sh --dry-run --dir "$FRESH" 2>&1)"
+if printf '%s' "$OUT" | grep -qF "$ESC"; then
+  bad '非终端环境默认不输出颜色'
+else
+  ok '非终端环境默认不输出颜色'
+fi
+
+# NO_COLOR 优先级高于 FORCE_COLOR
+OUT="$(NO_COLOR=1 FORCE_COLOR=1 bash install.sh --dry-run --dir "$FRESH" 2>&1)"
+if printf '%s' "$OUT" | grep -qF "$ESC"; then
+  bad 'NO_COLOR 优先于 FORCE_COLOR'
+else
+  ok 'NO_COLOR 优先于 FORCE_COLOR'
+fi
+
 rm -rf "$WORK" 2>/dev/null || true
 
 printf '─%.0s' {1..60}; printf '\n'
